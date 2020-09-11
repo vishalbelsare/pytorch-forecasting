@@ -128,6 +128,96 @@ class NBEATSSeasonalBlock(NBEATSBlock):
         return np.linspace(0, (self.backcast_length + self.forecast_length) / self.min_period, n)
 
 
+class NBEATSEnhancedSeasonalBlock(NBEATSBlock):
+    """
+    Model spectrum of frequencies as mixed Gaussian distribution.
+    """
+
+    def __init__(
+        self,
+        units,
+        thetas_dim=32,
+        num_block_layers=4,
+        backcast_length=10,
+        forecast_length=5,
+        dropout=0.1,
+    ):
+
+        super().__init__(
+            units=units,
+            thetas_dim=thetas_dim,
+            num_block_layers=num_block_layers,
+            backcast_length=backcast_length,
+            forecast_length=forecast_length,
+            share_thetas=True,
+            dropout=dropout,
+        )
+        assert (
+            self.thetas_dim % 4 == 0
+        ), "Theta dimensions must be dividable by 4 for amplitude, width, frequency and phase for each gaussian"
+
+        backcast_linspace = torch.arange(backcast_length, dtype=torch.float)
+        forecast_linspace = torch.arange(backcast_length, backcast_length + forecast_length, dtype=torch.float)
+        frequencies = 1.0 / torch.arange(2.0, (backcast_length + forecast_length) * 2 + 1, dtype=torch.float)
+
+        cos_b = torch.cos(2 * np.pi * frequencies.unsqueeze(-1) * backcast_linspace)
+        sin_b = torch.sin(2 * np.pi * frequencies.unsqueeze(-1) * backcast_linspace)
+        self.register_buffer("s_backcast", torch.cat([sin_b, cos_b]))
+
+        sin_f = torch.sin(2 * np.pi * frequencies.unsqueeze(-1) * forecast_linspace)
+        cos_f = torch.cos(2 * np.pi * frequencies.unsqueeze(-1) * forecast_linspace)
+        self.register_buffer("s_forecast", torch.cat([sin_f, cos_f]))
+        self.register_buffer("frequencies", frequencies)
+        self.frequency_norm = nn.LayerNorm(self.thetas_dim // 4)
+        self.width_norm = nn.LayerNorm(self.thetas_dim // 4)
+        self.softplus = nn.Softplus(beta=10)
+        self.sigmoid = nn.Sigmoid()
+
+    def calculate_amplitudes(self, coeff):
+        params = coeff.view(
+            coeff.size(0), -1, 4
+        )  # n_samples x n_gaussians x (amplitudes_sin, amplitudes_cos, width, frequency)
+
+        # extract parameters
+        center_frequencies = 1.0 / (
+            1.0
+            + self.sigmoid(self.frequency_norm(params[..., 3])).unsqueeze(-1)
+            * (self.backcast_length + self.forecast_length)
+        )
+        gaussian_sin_amplitudes = params[..., 0].unsqueeze(-1)
+        gaussian_cos_amplitudes = params[..., 1].unsqueeze(-1)
+        inverse_widths = center_frequencies / self.softplus(self.width_norm(params[..., 2]).unsqueeze(-1)).clamp(
+            min=1e-6
+        )
+
+        # calculate amplitudes
+        exponent = torch.pow((self.frequencies - center_frequencies) * inverse_widths, 2) / 2
+        normalized_amplitudes = F.softmax(exponent, dim=-1)
+        amplitude_sin = (normalized_amplitudes * gaussian_sin_amplitudes).sum(1)
+        amplitude_cos = (normalized_amplitudes * gaussian_cos_amplitudes).sum(1)
+        amplitudes = torch.cat([amplitude_sin, amplitude_cos], dim=-1)
+
+        return amplitudes
+
+    def forward(self, x) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = super().forward(x)
+
+        # backwards
+        coeff_backward = self.theta_b_fc(x)
+        amplitudes_backward = self.calculate_amplitudes(coeff_backward)
+        backcast = amplitudes_backward.mm(self.s_backcast)
+
+        # forwards
+        if self.share_thetas:
+            amplitudes_forward = amplitudes_backward
+        else:
+            coeff_forward = self.theta_f_fc(x)
+            amplitudes_forward = self.calculate_amplitudes(coeff_forward)
+        forecast = amplitudes_forward.mm(self.s_forecast)
+
+        return backcast, forecast
+
+
 class NBEATSTrendBlock(NBEATSBlock):
     def __init__(
         self,
@@ -159,8 +249,13 @@ class NBEATSTrendBlock(NBEATSBlock):
 
     def forward(self, x) -> Tuple[torch.Tensor, torch.Tensor]:
         x = super().forward(x)
-        backcast = self.theta_b_fc(x).mm(self.T_backcast)
-        forecast = self.theta_f_fc(x).mm(self.T_forecast)
+        coefficients_backward = self.theta_b_fc(x)
+        if self.share_thetas:
+            coefficients_forward = coefficients_backward
+        else:
+            coefficients_forward = self.theta_f_fc(x)
+        backcast = coefficients_backward.mm(self.T_backcast)
+        forecast = coefficients_forward.mm(self.T_forecast)
         return backcast, forecast
 
 
