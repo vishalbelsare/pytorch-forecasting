@@ -4,24 +4,23 @@ Timeseries datasets.
 Timeseries data is special and has to be processed and fed to algorithms in a special way. This module
 defines a class that is able to handle a wide variety of timeseries data problems.
 """
+
 from copy import copy as _copy, deepcopy
 from functools import lru_cache
 import inspect
 from typing import Any, Callable, Dict, List, Tuple, Union
 import warnings
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.exceptions import NotFittedError
 from sklearn.preprocessing import RobustScaler, StandardScaler
-from sklearn.utils import shuffle
 from sklearn.utils.validation import check_is_fitted
 import torch
 from torch.distributions import Beta
 from torch.nn.utils import rnn
 from torch.utils.data import DataLoader, Dataset
-from torch.utils.data.sampler import Sampler
+from torch.utils.data.sampler import Sampler, SequentialSampler
 
 from pytorch_forecasting.data.encoders import (
     EncoderNormalizer,
@@ -30,6 +29,9 @@ from pytorch_forecasting.data.encoders import (
     NaNLabelEncoder,
     TorchNormalizer,
 )
+from pytorch_forecasting.data.samplers import TimeSynchronizedBatchSampler
+from pytorch_forecasting.utils import repr_class
+from pytorch_forecasting.utils._dependencies import _check_matplotlib
 
 
 def _find_end_indices(diffs: np.ndarray, max_lengths: np.ndarray, min_length: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -130,6 +132,47 @@ class TimeSeriesDataSet(Dataset):
     * etc.
     """
 
+    # todo: refactor:
+    # - creating base class with minimal functionality
+    # - "outsource" transformations -> use pytorch transformations as default
+
+    # todo: integrate graphs
+    # - add option to pass networkx graph to the dataset -> clearly defined
+    # - create method to create networkx graph for hierachies -> clearly defined
+    # - convert networkx graph to pytorch geometric graph
+    # - create sampler to sample from the graph
+    # - create option in `to_dataloader` method to use a graph sampler
+    #     -> automatically changing collate function which returns graphs
+    #     -> should incorporate entire dataset but be compatible with current approach
+    # - integrate hierachical loss somehow into loss metrics
+
+    # how to get there:
+    # - add networkx and pytorch_geometric to requirements BUT as extras
+    #     -> do we also need torch_sparse, etc.? -> can we avoid this? probably not
+    # - networkx graph: define what makes sense from user perspective
+    # - define conversion into pytorch geometric graph? is this a two-step process of
+    #     - encoding networkx graph and converting it into "unfilled" pytorch geometric graph
+    #     - then creating full graph in collate function on the fly?
+    #     - or is data already stored in pytorch geometric graph and we only cut through it?
+    #     - dataformat would change? Is is all timeseries data? + mask when valid?
+    #     - then making cuts through the graph in sampling?
+    #     - would it be best in this case to re-think the timeseries class and design it as series of transformations?
+    #     - what is the new master data? very off current state or very similar?
+    #     - current approach is storing data in long format which is memory efficient and using the index object to
+    #       make sense of it when accessing. graphs would require wide format?
+    # - do NOT overengineer, i.e. support only usecase of single static graph, but only subset might be relevant
+    #     -> however, should think what happens if we want a dynamic graph. would this completely change the
+    #        data format?
+
+    # decisions:
+    # - stay with long format and create graph on the fly even if hampering efficiency and performance
+    # - go with pytorch_geometric approach for future proofing
+    # - directly convert networkx into pytorch_geometric graph
+    # - sampling: support only time-synchronized.
+    #     - sample randomly an instance from index as now.
+    #     - then get additional samples as per graph (that has been created) and available data
+    #     - then collate into graph object
+
     def __init__(
         self,
         data: pd.DataFrame,
@@ -155,7 +198,7 @@ class TimeSeriesDataSet(Dataset):
         add_relative_time_idx: bool = False,
         add_target_scales: bool = False,
         add_encoder_length: Union[bool, str] = "auto",
-        target_normalizer: Union[NORMALIZER, str, List[NORMALIZER], Tuple[NORMALIZER]] = "auto",
+        target_normalizer: Union[NORMALIZER, str, List[NORMALIZER], Tuple[NORMALIZER], None] = "auto",
         categorical_encoders: Dict[str, NaNLabelEncoder] = {},
         scalers: Dict[str, Union[StandardScaler, RobustScaler, TorchNormalizer, EncoderNormalizer]] = {},
         randomize_length: Union[None, Tuple[float, float], bool] = False,
@@ -249,7 +292,7 @@ class TimeSeriesDataSet(Dataset):
                 the index will range from -encoder_length to prediction_length)
             add_target_scales (bool): if to add scales for target to static real features (i.e. add the center and scale
                 of the unnormalized timeseries as features)
-            add_encoder_length (bool): if to add decoder length to list of static real variables.
+            add_encoder_length (bool): if to add encoder length to list of static real variables.
                 Defaults to "auto", i.e. ``True`` if ``min_encoder_length != max_encoder_length``.
             target_normalizer (Union[TorchNormalizer, NaNLabelEncoder, EncoderNormalizer, str, list, tuple]):
                 transformer that take group_ids, target and time_idx to normalize targets.
@@ -436,7 +479,7 @@ class TimeSeriesDataSet(Dataset):
             assert target not in self.scalers, "Target normalizer is separate and not in scalers."
 
         # create index
-        self.index = self._construct_index(data, predict_mode=predict_mode)
+        self.index = self._construct_index(data, predict_mode=self.predict_mode)
 
         # convert to torch tensor for high performance data loading later
         self.data = self._data_to_tensors(data)
@@ -548,8 +591,9 @@ class TimeSeriesDataSet(Dataset):
             self.target_normalizer = MultiNormalizer(self.target_normalizer)
         elif self.target_normalizer is None:
             self.target_normalizer = TorchNormalizer(method="identity")
-        assert self.min_encoder_length > 1 or not isinstance(
-            self.target_normalizer, EncoderNormalizer
+        assert (
+            not isinstance(self.target_normalizer, EncoderNormalizer)
+            or self.min_encoder_length >= self.target_normalizer.min_length
         ), "EncoderNormalizer is only allowed if min_encoder_length > 1"
         assert isinstance(
             self.target_normalizer, (TorchNormalizer, NaNLabelEncoder)
@@ -704,7 +748,6 @@ class TimeSeriesDataSet(Dataset):
 
         # train target normalizer
         if self.target_normalizer is not None:
-
             # fit target normalizer
             try:
                 check_is_fitted(self.target_normalizer)
@@ -779,7 +822,7 @@ class TimeSeriesDataSet(Dataset):
                     check_is_fitted(self.scalers[name])
                 except NotFittedError:
                     if isinstance(self.scalers[name], GroupNormalizer):
-                        self.scalers[name] = self.scalers[name].fit(data[[name]], data)
+                        self.scalers[name] = self.scalers[name].fit(data[name], data)
                     else:
                         self.scalers[name] = self.scalers[name].fit(data[[name]])
 
@@ -1167,19 +1210,20 @@ class TimeSeriesDataSet(Dataset):
             predict_mode (bool): if to create one same per group with prediction length equals ``max_decoder_length``
 
         Returns:
-            pd.DataFrame: index dataframe
+            pd.DataFrame: index dataframe for timesteps and index dataframe for groups.
+                It contains a list of all possible subsequences.
         """
         g = data.groupby(self._group_ids, observed=True)
 
-        df_index_first = g["__time_idx__"].transform("nth", 0).to_frame("time_first")
-        df_index_last = g["__time_idx__"].transform("nth", -1).to_frame("time_last")
+        df_index_first = g["__time_idx__"].transform("first").to_frame("time_first")
+        df_index_last = g["__time_idx__"].transform("last").to_frame("time_last")
         df_index_diff_to_next = -g["__time_idx__"].diff(-1).fillna(-1).astype(int).to_frame("time_diff_to_next")
         df_index = pd.concat([df_index_first, df_index_last, df_index_diff_to_next], axis=1)
         df_index["index_start"] = np.arange(len(df_index))
         df_index["time"] = data["__time_idx__"]
         df_index["count"] = (df_index["time_last"] - df_index["time_first"]).astype(int) + 1
-        group_ids = g.ngroup()
-        df_index["group_id"] = group_ids
+        sequence_ids = g.ngroup()
+        df_index["sequence_id"] = sequence_ids
 
         min_sequence_length = self.min_prediction_length + self.min_encoder_length
         max_sequence_length = self.max_prediction_length + self.max_encoder_length
@@ -1227,11 +1271,11 @@ class TimeSeriesDataSet(Dataset):
                 & (x["sequence_length"] >= min_sequence_length)
             ]
             # choose longest sequence
-            df_index = df_index.loc[df_index.groupby("group_id").sequence_length.idxmax()]
+            df_index = df_index.loc[df_index.groupby("sequence_id").sequence_length.idxmax()]
 
         # check that all groups/series have at least one entry in the index
-        if not group_ids.isin(df_index.group_id).all():
-            missing_groups = data.loc[~group_ids.isin(df_index.group_id), self._group_ids].drop_duplicates()
+        if not sequence_ids.isin(df_index.sequence_id).all():
+            missing_groups = data.loc[~sequence_ids.isin(df_index.sequence_id), self._group_ids].drop_duplicates()
             # decode values
             for name, id in self._group_ids_mapping.items():
                 missing_groups[id] = self.transform_values(name, missing_groups[id], inverse=True, group_id=True)
@@ -1305,20 +1349,15 @@ class TimeSeriesDataSet(Dataset):
                 time_idx_last=self.data["time"][index_last].numpy(),
                 # prediction index is last time index - decoder length + 1
                 time_idx_first_prediction=lambda x: x.time_idx_last
-                # decoder length is minimum of
-                - (
-                    x.time_idx_last - x.time_idx_first + 1 - self.min_encoder_length
-                )  # sequence lenght - min decoder length
-                .clip(upper=self.max_prediction_length)  # maximum prediction length
-                .clip(upper=x.time_idx_last - (self.min_prediction_idx - 1))  # not going beyond min prediction idx
+                - self.calculate_decoder_length(
+                    time_last=x.time_idx_last, sequence_length=x.time_idx_last - x.time_idx_first + 1
+                )
                 + 1,
             )
         )
         return index
 
-    def plot_randomization(
-        self, betas: Tuple[float, float] = None, length: int = None, min_length: int = None
-    ) -> Tuple[plt.Figure, torch.Tensor]:
+    def plot_randomization(self, betas: Tuple[float, float] = None, length: int = None, min_length: int = None):
         """
         Plot expected randomized length distribution.
 
@@ -1331,6 +1370,10 @@ class TimeSeriesDataSet(Dataset):
         Returns:
             Tuple[plt.Figure, torch.Tensor]: tuple of figure and histogram based on 1000 samples
         """
+        _check_matplotlib("plot_randomization")
+
+        import matplotlib.pyplot as plt
+
         if betas is None:
             betas = self.randomize_length
         if length is None:
@@ -1393,6 +1436,37 @@ class TimeSeriesDataSet(Dataset):
         Reset values used to override sample features.
         """
         self._overwrite_values = None
+
+    def calculate_decoder_length(
+        self,
+        time_last: Union[int, pd.Series, np.ndarray],
+        sequence_length: Union[int, pd.Series, np.ndarray],
+    ) -> Union[int, pd.Series, np.ndarray]:
+        """
+        Calculate length of decoder.
+
+        Args:
+            time_last (Union[int, pd.Series, np.ndarray]): last time index of the sequence
+            sequence_length (Union[int, pd.Series, np.ndarray]): total length of the sequence
+
+        Returns:
+            Union[int, pd.Series, np.ndarray]: decoder length(s)
+        """
+        if isinstance(time_last, int):
+            decoder_length = min(
+                time_last - (self.min_prediction_idx - 1),  # not going beyond min prediction idx
+                self.max_prediction_length,  # maximum prediction length
+                sequence_length - self.min_encoder_length,  # sequence length - min decoder length
+            )
+        else:
+            decoder_length = np.min(
+                [
+                    time_last - (self.min_prediction_idx - 1),
+                    sequence_length - self.min_encoder_length,
+                ],
+                axis=0,
+            ).clip(max=self.max_prediction_length)
+        return decoder_length
 
     def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
         """
@@ -1463,11 +1537,7 @@ class TimeSeriesDataSet(Dataset):
             sequence_length >= self.min_prediction_length
         ), "Sequence length should be at least minimum prediction length"
         # determine prediction/decode length and encode length
-        decoder_length = min(
-            time[-1] - (self.min_prediction_idx - 1),
-            self.max_prediction_length,
-            sequence_length - self.min_encoder_length,
-        )
+        decoder_length = self.calculate_decoder_length(time[-1], sequence_length)
         encoder_length = sequence_length - decoder_length
         assert (
             decoder_length >= self.min_prediction_length
@@ -1492,14 +1562,16 @@ class TimeSeriesDataSet(Dataset):
                 data_cat = data_cat[encoder_length - new_encoder_length : encoder_length + new_decoder_length]
                 data_cont = data_cont[encoder_length - new_encoder_length : encoder_length + new_decoder_length]
                 target = [t[encoder_length - new_encoder_length : encoder_length + new_decoder_length] for t in target]
+                if weight is not None:
+                    weight = weight[encoder_length - new_encoder_length : encoder_length + new_decoder_length]
                 encoder_length = new_encoder_length
                 decoder_length = new_decoder_length
 
             # switch some variables to nan if encode length is 0
             if encoder_length == 0 and len(self.dropout_categoricals) > 0:
-                data_cat[
-                    :, [self.flat_categoricals.index(c) for c in self.dropout_categoricals]
-                ] = 0  # zero is encoded nan
+                data_cat[:, [self.flat_categoricals.index(c) for c in self.dropout_categoricals]] = (
+                    0  # zero is encoded nan
+                )
 
         assert decoder_length > 0, "Decoder length should be greater than 0"
         assert encoder_length >= 0, "Encoder length should be at least 0"
@@ -1602,8 +1674,9 @@ class TimeSeriesDataSet(Dataset):
             (target, weight),
         )
 
+    @staticmethod
     def _collate_fn(
-        self, batches: List[Tuple[Dict[str, torch.Tensor], torch.Tensor]]
+        batches: List[Tuple[Dict[str, torch.Tensor], torch.Tensor]]
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
         """
         Collate function to combine items into mini-batch for dataloader.
@@ -1651,10 +1724,14 @@ class TimeSeriesDataSet(Dataset):
                 if isinstance(batches[0][0]["target_scale"][idx], torch.Tensor):  # stack tensor
                     scale = torch.stack([batch[0]["target_scale"][idx] for batch in batches])
                 else:
-                    scale = torch.tensor([batch[0]["target_scale"][idx] for batch in batches], dtype=torch.float)
+                    scale = torch.from_numpy(
+                        np.array([batch[0]["target_scale"][idx] for batch in batches], dtype=np.float32),
+                    )
                 target_scale.append(scale)
         else:  # convert to tensor
-            target_scale = torch.tensor([batch[0]["target_scale"] for batch in batches], dtype=torch.float)
+            target_scale = torch.from_numpy(
+                np.array([batch[0]["target_scale"] for batch in batches], dtype=np.float32),
+            )
 
         # target and weight
         if isinstance(batches[0][1][0], (tuple, list)):
@@ -1777,7 +1854,10 @@ class TimeSeriesDataSet(Dataset):
             if isinstance(sampler, str):
                 if sampler == "synchronized":
                     kwargs["batch_sampler"] = TimeSynchronizedBatchSampler(
-                        self, batch_size=kwargs["batch_size"], shuffle=kwargs["shuffle"], drop_last=kwargs["drop_last"]
+                        SequentialSampler(self),
+                        batch_size=kwargs["batch_size"],
+                        shuffle=kwargs["shuffle"],
+                        drop_last=kwargs["drop_last"],
                     )
                 else:
                     raise ValueError(f"batch_sampler {sampler} unknown - see docstring for valid batch_sampler")
@@ -1805,107 +1885,5 @@ class TimeSeriesDataSet(Dataset):
         index = pd.DataFrame(index_data)
         return index
 
-
-class TimeSynchronizedBatchSampler(Sampler):
-    """
-    Samples mini-batches randomly but in a time-synchronised manner.
-
-    Time-synchornisation means that the time index of the first decoder samples are aligned across the batch.
-    This sampler does not support missing values in the dataset.
-    """
-
-    def __init__(
-        self,
-        data_source: TimeSeriesDataSet,
-        batch_size: int = 64,
-        shuffle: bool = False,
-        drop_last: bool = False,
-    ):
-        """
-        Initialize TimeSynchronizedBatchSampler.
-
-        Args:
-            data_source (TimeSeriesDataSet): timeseries dataset.
-            drop_last (bool): if to drop last mini-batch from a group if it is smaller than batch_size.
-                Defaults to False.
-            shuffle (bool): if to shuffle dataset. Defaults to False.
-            batch_size (int, optional): Number of samples in a mini-batch. This is rather the maximum number
-                of samples. Because mini-batches are grouped by prediction time, chances are that there
-                are multiple where batch size will be smaller than the maximum. Defaults to 64.
-        """
-        # Since collections.abc.Iterable does not check for `__getitem__`, which
-        # is one way for an object to be an iterable, we don't do an `isinstance`
-        # check here.
-        if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size <= 0:
-            raise ValueError(
-                "batch_size should be a positive integer value, " "but got batch_size={}".format(batch_size)
-            )
-        if not isinstance(drop_last, bool):
-            raise ValueError("drop_last should be a boolean value, but got " "drop_last={}".format(drop_last))
-        self.data_source = data_source
-        self.batch_size = batch_size
-        self.drop_last = drop_last
-        self.shuffle = shuffle
-        assert (
-            not self.data_source.allow_missing_timesteps
-        ), "allow_missing_timesteps should be False for time-synchronized mini-batches"
-
-        # construct index from which can be sampled
-        self.construct_batch_groups()
-
-    def construct_batch_groups(self):
-        """
-        Construct index of batches from which can be sampled
-        """
-        index = self.data_source.index
-        # get groups, i.e. group all samples by first predict time
-        decoder_lengths = np.min(
-            [
-                index.time_last - (self.data_source.min_prediction_idx - 1),
-                index.sequence_length - self.data_source.min_encoder_length,
-            ],
-            axis=0,
-        ).clip(max=self.data_source.max_prediction_length)
-        first_prediction_time = index.time + index.sequence_length - decoder_lengths + 1
-        self._groups = pd.RangeIndex(0, len(index.index)).groupby(first_prediction_time)
-
-        # calculate sizes of groups
-        self._group_sizes = {}
-        warns = []
-        for name, group in self._groups.items():  # iterate over groups
-            if self.drop_last:
-                self._group_sizes[name] = len(group) // self.batch_size
-            else:
-                self._group_sizes[name] = (len(group) + self.batch_size - 1) // self.batch_size
-            if self._group_sizes[name] == 0:
-                self._group_sizes[name] = 1
-                warns.append(name)
-        if len(warns) > 0:
-            warnings.warn(
-                f"Less than {self.batch_size} samples available for {len(warns)} prediction times. "
-                f"Use batch size smaller than {self.batch_size}. "
-                f"First 10 prediction times with small batch sizes: {warns[:10]}"
-            )
-        # create index from which can be sampled: index is equal to number of batches
-        # associate index with prediction time
-        self._group_index = np.repeat(list(self._group_sizes.keys()), list(self._group_sizes.values()))
-        # associate index with batch within prediction time group
-        self._sub_group_index = np.concatenate([np.arange(size) for size in self._group_sizes.values()])
-
-    def __iter__(self):
-        if self.shuffle:  # shuffle samples
-            groups = {name: shuffle(group) for name, group in self._groups.items()}
-        else:
-            groups = self._groups
-
-        batch_samples = np.random.permutation(len(self))
-        for idx in batch_samples:
-            name = self._group_index[idx]
-            sub_group = self._sub_group_index[idx]
-            sub_group_start = sub_group * self.batch_size
-            sub_group_end = sub_group_start + self.batch_size
-            batch = groups[name][sub_group_start:sub_group_end]
-            yield batch
-
-    def __len__(self):
-        return len(self._group_index)
+    def __repr__(self) -> str:
+        return repr_class(self, attributes=self.get_parameters(), extra_attributes=dict(length=len(self)))

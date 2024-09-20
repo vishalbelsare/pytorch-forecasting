@@ -1,6 +1,7 @@
 """
 PyTorch Forecasting package for timeseries forecasting with PyTorch.
 """
+
 from pytorch_forecasting.data import (
     EncoderNormalizer,
     GroupNormalizer,
@@ -14,15 +15,15 @@ from pytorch_forecasting.metrics import (
     MASE,
     RMSE,
     SMAPE,
-    AggregationMetric,
     BetaDistributionLoss,
-    CompositeMetric,
     CrossEntropy,
     DistributionLoss,
+    ImplicitQuantileNetworkDistributionLoss,
     LogNormalDistributionLoss,
-    Metric,
+    MQF2DistributionLoss,
     MultiHorizonMetric,
     MultiLoss,
+    MultivariateNormalDistributionLoss,
     NegativeBinomialDistributionLoss,
     NormalDistributionLoss,
     PoissonLoss,
@@ -40,6 +41,7 @@ from pytorch_forecasting.models import (
     DeepAR,
     MultiEmbedding,
     NBeats,
+    NHiTS,
     RecurrentNetwork,
     TemporalFusionTransformer,
     get_rnn,
@@ -66,6 +68,7 @@ __all__ = [
     "MultiNormalizer",
     "TemporalFusionTransformer",
     "NBeats",
+    "NHiTS",
     "Baseline",
     "DeepAR",
     "BaseModel",
@@ -78,14 +81,14 @@ __all__ = [
     "MAPE",
     "MASE",
     "SMAPE",
-    "Metric",
-    "AggregationMetric",
-    "CompositeMetric",
     "DistributionLoss",
     "BetaDistributionLoss",
     "LogNormalDistributionLoss",
     "NegativeBinomialDistributionLoss",
     "NormalDistributionLoss",
+    "ImplicitQuantileNetworkDistributionLoss",
+    "MultivariateNormalDistributionLoss",
+    "MQF2DistributionLoss",
     "CrossEntropy",
     "PoissonLoss",
     "QuantileLoss",
@@ -109,4 +112,4 @@ __all__ = [
     "unpack_sequence",
 ]
 
-__version__ = "0.0.0"
+__version__ = "1.1.1"

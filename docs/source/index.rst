@@ -27,7 +27,6 @@ Specifically, the package provides
 * Multiple neural network architectures for timeseries forecasting that have been enhanced
   for real-world deployment and come with in-built interpretation capabilities
 * Multi-horizon timeseries metrics
-* Ranger optimizer for faster model training
 * Hyperparameter tuning with `optuna <https://optuna.readthedocs.io/>`_
 
 The package is built on `PyTorch Lightning <https://pytorch-lightning.readthedocs.io/>`_ to allow
@@ -47,6 +46,12 @@ or to install via conda
 
    conda install pytorch-forecasting pytorch>=1.7 -c pytorch -c conda-forge
 
+To use the MQF2 loss (multivariate quantile loss), also execute
+
+.. code-block::
+
+   pip install pytorch-forecasting[mqf2]
+
 Vist :ref:`Getting started <getting-started>` to learn more about the package and detailled installation instruction.
 The :ref:`Tutorials <tutorials>` section provides guidance on how to use models and implement new ones.
 
@@ -64,7 +69,6 @@ The :ref:`Tutorials <tutorials>` section provides guidance on how to use models 
    contribute
    api
    CHANGELOG
-   GitHub <https://github.com/jdb78/pytorch-forecasting>
 
 
 Indices and tables

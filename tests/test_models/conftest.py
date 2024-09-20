@@ -6,6 +6,8 @@ from pytorch_forecasting import TimeSeriesDataSet
 from pytorch_forecasting.data import EncoderNormalizer, GroupNormalizer, NaNLabelEncoder
 from pytorch_forecasting.data.examples import generate_ar_data, get_stallion_data
 
+torch.manual_seed(23)
+
 
 @pytest.fixture(scope="session")
 def gpus():
@@ -54,8 +56,8 @@ def data_with_covariates():
 
 def make_dataloaders(data_with_covariates, **kwargs):
     training_cutoff = "2016-09-01"
-    max_encoder_length = 5
-    max_prediction_length = 2
+    max_encoder_length = 4
+    max_prediction_length = 3
 
     kwargs.setdefault("target", "volume")
     kwargs.setdefault("group_ids", ["agency", "sku"])
@@ -112,7 +114,7 @@ def make_dataloaders(data_with_covariates, **kwargs):
         dict(static_categoricals=["agency", "sku"]),
         dict(randomize_length=True, min_encoder_length=2),
         dict(target_normalizer=EncoderNormalizer(), min_encoder_length=2),
-        dict(target_normalizer=GroupNormalizer(transformation="log")),
+        dict(target_normalizer=GroupNormalizer(transformation="log1p")),
         dict(target_normalizer=GroupNormalizer(groups=["agency", "sku"], transformation="softplus", center=False)),
         dict(target="agency"),
         # test multiple targets
@@ -130,6 +132,37 @@ def multiple_dataloaders_with_covariates(data_with_covariates, request):
 
 
 @pytest.fixture(scope="session")
+def dataloaders_with_different_encoder_decoder_length(data_with_covariates):
+    return make_dataloaders(
+        data_with_covariates.copy(),
+        target="target",
+        time_varying_known_categoricals=["special_days", "month"],
+        variable_groups=dict(
+            special_days=[
+                "easter_day",
+                "good_friday",
+                "new_year",
+                "christmas",
+                "labor_day",
+                "independence_day",
+                "revolution_day_memorial",
+                "regional_games",
+                "fifa_u_17_world_cup",
+                "football_gold_cup",
+                "beer_capital",
+                "music_fest",
+            ]
+        ),
+        time_varying_known_reals=["time_idx", "price_regular", "price_actual", "discount", "discount_in_percent"],
+        time_varying_unknown_categoricals=[],
+        time_varying_unknown_reals=["target", "volume", "log_volume", "industry_volume", "soda_volume", "avg_max_temp"],
+        static_categoricals=["agency"],
+        add_relative_time_idx=False,
+        target_normalizer=GroupNormalizer(groups=["agency", "sku"], center=False),
+    )
+
+
+@pytest.fixture(scope="session")
 def dataloaders_with_covariates(data_with_covariates):
     return make_dataloaders(
         data_with_covariates.copy(),
@@ -137,8 +170,18 @@ def dataloaders_with_covariates(data_with_covariates):
         time_varying_known_reals=["discount"],
         time_varying_unknown_reals=["target"],
         static_categoricals=["agency"],
-        add_relative_time_idx=True,
+        add_relative_time_idx=False,
         target_normalizer=GroupNormalizer(groups=["agency", "sku"], center=False),
+    )
+
+
+@pytest.fixture(scope="session")
+def dataloaders_multi_target(data_with_covariates):
+    return make_dataloaders(
+        data_with_covariates.copy(),
+        time_varying_unknown_reals=["target", "discount"],
+        target=["target", "discount"],
+        add_relative_time_idx=False,
     )
 
 

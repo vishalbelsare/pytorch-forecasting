@@ -1,11 +1,16 @@
 """
 Helper functions for PyTorch forecasting
 """
+
+from collections import namedtuple
 from contextlib import redirect_stdout
+import inspect
 import os
 from typing import Any, Callable, Dict, List, Tuple, Union
 
+import lightning.pytorch as pl
 import torch
+from torch import nn
 from torch.fft import irfft, rfft
 import torch.nn.functional as F
 from torch.nn.utils import rnn
@@ -109,7 +114,7 @@ def get_embedding_size(n: int, max_size: int = 100) -> int:
         int: embedding size
     """
     if n > 2:
-        return min(round(1.6 * n ** 0.56), max_size)
+        return min(round(1.6 * n**0.56), max_size)
     else:
         return 1
 
@@ -226,6 +231,31 @@ def unpack_sequence(sequence: Union[torch.Tensor, rnn.PackedSequence]) -> Tuple[
     return sequence, lengths
 
 
+def concat_sequences(
+    sequences: Union[List[torch.Tensor], List[rnn.PackedSequence]]
+) -> Union[torch.Tensor, rnn.PackedSequence]:
+    """
+    Concatenate RNN sequences.
+
+    Args:
+        sequences (Union[List[torch.Tensor], List[rnn.PackedSequence]): list of RNN packed sequences or tensors of which
+            first index are samples and second are timesteps
+
+    Returns:
+        Union[torch.Tensor, rnn.PackedSequence]: concatenated sequence
+    """
+    if isinstance(sequences[0], rnn.PackedSequence):
+        return rnn.pack_sequence(sequences, enforce_sorted=False)
+    elif isinstance(sequences[0], torch.Tensor):
+        return torch.cat(sequences, dim=1)
+    elif isinstance(sequences[0], (tuple, list)):
+        return tuple(
+            concat_sequences([sequences[ii][i] for ii in range(len(sequences))]) for i in range(len(sequences[0]))
+        )
+    else:
+        raise ValueError("Unsupported sequence type")
+
+
 def padded_stack(
     tensors: List[torch.Tensor], side: str = "right", mode: str = "constant", value: Union[int, float] = 0
 ) -> torch.Tensor:
@@ -337,6 +367,42 @@ class OutputMixIn:
     def keys(self):
         return self._fields
 
+    def iget(self, idx: Union[int, slice]):
+        """Select item(s) row-wise.
+
+        Args:
+            idx ([int, slice]): item to select
+
+        Returns:
+            Output of single item.
+        """
+        return self.__class__(*(x[idx] for x in self))
+
+
+class TupleOutputMixIn:
+    """MixIn to give output a namedtuple-like access capabilities with ``to_network_output() function``."""
+
+    def to_network_output(self, **results):
+        """
+        Convert output into a named (and immuatable) tuple.
+
+        This allows tracing the modules as graphs and prevents modifying the output.
+
+        Returns:
+            named tuple
+        """
+        if hasattr(self, "_output_class"):
+            Output = self._output_class
+        else:
+            OutputTuple = namedtuple("output", results)
+
+            class Output(OutputMixIn, OutputTuple):
+                pass
+
+            self._output_class = Output
+
+        return self._output_class(**results)
+
 
 def move_to_device(
     x: Union[
@@ -363,7 +429,14 @@ def move_to_device(
         x on targeted device
     """
     if isinstance(device, str):
-        device = torch.device(device)
+        if device == "mps":
+            if hasattr(torch.backends, device):
+                if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+                    device = torch.device("mps")
+                else:
+                    device = torch.device("cpu")
+        else:
+            device = torch.device(device)
     if isinstance(x, dict):
         for name in x.keys():
             x[name] = move_to_device(x[name], device=device)
@@ -410,3 +483,84 @@ def detach(
         return [detach(xi) for xi in x]
     else:
         return x
+
+
+def masked_op(tensor: torch.Tensor, op: str = "mean", dim: int = 0, mask: torch.Tensor = None) -> torch.Tensor:
+    """Calculate operation on masked tensor.
+
+    Args:
+        tensor (torch.Tensor): tensor to conduct operation over
+        op (str): operation to apply. One of ["mean", "sum"]. Defaults to "mean".
+        dim (int, optional): dimension to average over. Defaults to 0.
+        mask (torch.Tensor, optional): boolean mask to apply (True=will take mean, False=ignore).
+            Masks nan values by default.
+
+    Returns:
+        torch.Tensor: tensor with averaged out dimension
+    """
+    if mask is None:
+        mask = ~torch.isnan(tensor)
+    masked = tensor.masked_fill(~mask, 0.0)
+    summed = masked.sum(dim=dim)
+    if op == "mean":
+        return summed / mask.sum(dim=dim)  # Find the average
+    elif op == "sum":
+        return summed
+    else:
+        raise ValueError(f"unkown operation {op}")
+
+
+def repr_class(
+    obj,
+    attributes: Union[List[str], Dict[str, Any]],
+    max_characters_before_break: int = 100,
+    extra_attributes: Dict[str, Any] = {},
+) -> str:
+    """Print class name and parameters.
+
+    Args:
+        obj: class to format
+        attributes (Union[List[str], Dict[str]]): list of attributes to show or dictionary of attributes and values
+            to show max_characters_before_break (int): number of characters before breaking the into multiple lines
+        extra_attributes (Dict[str, Any]): extra attributes to show in angled brackets
+
+    Returns:
+        str
+    """
+    # get attributes
+    if isinstance(attributes, (tuple, list)):
+        attributes = {name: getattr(obj, name) for name in attributes if hasattr(obj, name)}
+    attributes_strings = [f"{name}={repr(value)}" for name, value in attributes.items()]
+    # get header
+    header_name = obj.__class__.__name__
+    # add extra attributes
+    if len(extra_attributes) > 0:
+        extra_attributes_strings = [f"{name}={repr(value)}" for name, value in extra_attributes.items()]
+        if len(header_name) + 2 + len(", ".join(extra_attributes_strings)) > max_characters_before_break:
+            header = f"{header_name}[\n\t" + ",\n\t".join(attributes_strings) + "\n]("
+        else:
+            header = f"{header_name}[{', '.join(extra_attributes_strings)}]("
+    else:
+        header = f"{header_name}("
+
+    # create final representation
+    attributes_string = ", ".join(attributes_strings)
+    if len(attributes_string) + len(header.split("\n")[-1]) + 1 > max_characters_before_break:
+        attributes_string = "\n\t" + ",\n\t".join(attributes_strings) + "\n"
+    return f"{header}{attributes_string})"
+
+
+class InitialParameterRepresenterMixIn:
+    def __repr__(self) -> str:
+        if isinstance(self, nn.Module):
+            return super().__repr__()
+        else:
+            attributes = list(inspect.signature(self.__class__).parameters.keys())
+            return repr_class(self, attributes=attributes)
+
+    def extra_repr(self) -> str:
+        if isinstance(self, pl.LightningModule):
+            return "\t" + repr(self.hparams).replace("\n", "\n\t")
+        else:
+            attributes = list(inspect.signature(self.__class__).parameters.keys())
+            return ", ".join([f"{name}={repr(getattr(self, name))}" for name in attributes if hasattr(self, name)])

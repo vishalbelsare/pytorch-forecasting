@@ -1,6 +1,7 @@
 """
 Simple recurrent model - either with LSTM or GRU cells.
 """
+
 from copy import copy
 from typing import Dict, List, Tuple, Union
 
@@ -109,7 +110,7 @@ class RecurrentNetwork(AutoRegressiveBaseModelWithCovariates):
 
         rnn_class = get_rnn(cell_type)
         cont_size = len(self.reals)
-        cat_size = sum([size[1] for size in self.hparams.embedding_sizes.values()])
+        cat_size = sum(self.embeddings.output_size.values())
         input_size = cont_size + cat_size
         self.rnn = rnn_class(
             input_size=input_size,
@@ -277,7 +278,7 @@ class RecurrentNetwork(AutoRegressiveBaseModelWithCovariates):
                 torch.arange(x["encoder_cont"].size(0), device=x["encoder_cont"].device),
                 x["encoder_lengths"] - 1,
                 self.target_positions.unsqueeze(-1),
-            ].T,
+            ].T.contiguous(),
         )
 
         output = self.decode(

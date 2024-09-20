@@ -3,21 +3,17 @@
 <https://www.sciencedirect.com/science/article/pii/S0169207019301888>`_
 which is the one of the most popular forecasting algorithms and is often used as a baseline
 """
-from copy import copy, deepcopy
-from typing import Any, Dict, List, Tuple, Union
 
-import matplotlib.pyplot as plt
-from matplotlib.pyplot import plot_date
+from copy import deepcopy
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+
 import numpy as np
 import pandas as pd
-from pytorch_lightning.core.lightning import LightningModule
 import torch
-import torch.distributions as dists
 import torch.nn as nn
-from torch.nn.utils import rnn
 from torch.utils.data.dataloader import DataLoader
 
-from pytorch_forecasting.data.encoders import EncoderNormalizer, MultiNormalizer, NaNLabelEncoder
+from pytorch_forecasting.data.encoders import MultiNormalizer, NaNLabelEncoder
 from pytorch_forecasting.data.timeseries import TimeSeriesDataSet
 from pytorch_forecasting.metrics import (
     MAE,
@@ -26,11 +22,11 @@ from pytorch_forecasting.metrics import (
     RMSE,
     SMAPE,
     DistributionLoss,
-    Metric,
     MultiLoss,
+    MultivariateDistributionLoss,
     NormalDistributionLoss,
 )
-from pytorch_forecasting.models.base_model import AutoRegressiveBaseModelWithCovariates
+from pytorch_forecasting.models.base_model import AutoRegressiveBaseModelWithCovariates, Prediction
 from pytorch_forecasting.models.nn import HiddenState, MultiEmbedding, get_rnn
 from pytorch_forecasting.utils import apply_to_list, to_list
 
@@ -67,6 +63,10 @@ class DeepAR(AutoRegressiveBaseModelWithCovariates):
 
         The code is based on the article `DeepAR: Probabilistic forecasting with autoregressive recurrent networks
         <https://www.sciencedirect.com/science/article/pii/S0169207019301888>`_.
+
+        By using a Multivariate Loss such as the
+        :py:class:`~pytorch_forecasting.metrics.MultivariateNormalDistributionLoss`,
+        the network is converted into a `DeepVAR network <http://arxiv.org/abs/1910.03002>`_.
 
         Args:
             cell_type (str, optional): Recurrent cell type ["LSTM", "GRU"]. Defaults to "LSTM".
@@ -140,7 +140,7 @@ class DeepAR(AutoRegressiveBaseModelWithCovariates):
 
         rnn_class = get_rnn(cell_type)
         cont_size = len(self.reals)
-        cat_size = sum([size[1] for size in self.hparams.embedding_sizes.values()])
+        cat_size = sum(self.embeddings.output_size.values())
         input_size = cont_size + cat_size
         self.rnn = rnn_class(
             input_size=input_size,
@@ -184,6 +184,10 @@ class DeepAR(AutoRegressiveBaseModelWithCovariates):
             not isinstance(dataset.target_normalizer, MultiNormalizer)
             or all([not isinstance(normalizer, NaNLabelEncoder) for normalizer in dataset.target_normalizer])
         ), "target(s) should be continuous - categorical targets are not supported"  # todo: remove this restriction
+        if isinstance(new_kwargs.get("loss", None), MultivariateDistributionLoss):
+            assert (
+                dataset.min_prediction_length == dataset.max_prediction_length
+            ), "Multivariate models require constant prediction lenghts"
         return super().from_dataset(
             dataset, allowed_encoder_known_variable_names=allowed_encoder_known_variable_names, **new_kwargs
         )
@@ -295,6 +299,7 @@ class DeepAR(AutoRegressiveBaseModelWithCovariates):
                 first_hidden_state=hidden_state,
                 target_scale=target_scale,
                 n_decoder_steps=input_vector.size(1),
+                n_samples=n_samples,
             )
             # reshape predictions for n_samples:
             # from n_samples * batch_size x time steps to batch_size x time steps x n_samples
@@ -314,7 +319,7 @@ class DeepAR(AutoRegressiveBaseModelWithCovariates):
                 torch.arange(x["encoder_cont"].size(0), device=x["encoder_cont"].device),
                 x["encoder_lengths"] - 1,
                 self.target_positions.unsqueeze(-1),
-            ].T,
+            ].T.contiguous(),
         )
 
         if self.training:
@@ -341,21 +346,6 @@ class DeepAR(AutoRegressiveBaseModelWithCovariates):
         )
         return log
 
-    def plot_prediction(
-        self,
-        x: Dict[str, torch.Tensor],
-        out: Dict[str, torch.Tensor],
-        idx: int,
-        add_loss_to_title: Union[Metric, torch.Tensor, bool] = False,
-        show_future_observed: bool = True,
-        ax=None,
-        **kwargs,
-    ) -> plt.Figure:
-        # workaround for not being able to compute loss for single sample without parameters of distribution
-        return super().plot_prediction(
-            x, out, idx=idx, add_loss_to_title=False, show_future_observed=show_future_observed, ax=ax, **kwargs
-        )
-
     def predict(
         self,
         data: Union[DataLoader, pd.DataFrame, TimeSeriesDataSet],
@@ -365,11 +355,15 @@ class DeepAR(AutoRegressiveBaseModelWithCovariates):
         batch_size: int = 64,
         num_workers: int = 0,
         fast_dev_run: bool = False,
-        show_progress_bar: bool = False,
         return_x: bool = False,
+        return_y: bool = False,
         mode_kwargs: Dict[str, Any] = None,
+        trainer_kwargs: Optional[Dict[str, Any]] = None,
+        write_interval: Literal["batch", "epoch", "batch_and_epoch"] = "batch",
+        output_dir: Optional[str] = None,
         n_samples: int = 100,
-    ):
+        **kwargs,
+    ) -> Prediction:
         """
         predict dataloader
 
@@ -386,13 +380,17 @@ class DeepAR(AutoRegressiveBaseModelWithCovariates):
             fast_dev_run: if to only return results of first batch
             show_progress_bar: if to show progress bar. Defaults to False.
             return_x: if to return network inputs (in the same order as prediction output)
+            return_y: if to return network targets (in the same order as prediction output)
             mode_kwargs (Dict[str, Any]): keyword arguments for ``to_prediction()`` or ``to_quantiles()``
                 for modes "prediction" and "quantiles"
+            trainer_kwargs (Dict[str, Any], optional): keyword arguments for the trainer
+            write_interval: interval to write predictions to disk
+            output_dir: directory to write predictions to. Defaults to None. If set function will return empty list
             n_samples: number of samples to draw. Defaults to 100.
 
         Returns:
-            output, x, index, decoder_lengths: some elements might not be present depending on what is configured
-                to be returned
+            Prediction: if one of the ```return`` arguments is present,
+                prediction tuple with fields ``prediction``, ``x``, ``y``, ``index`` and ``decoder_lengths``
         """
         if isinstance(mode, str):
             if mode in ["prediction", "quantiles"]:
@@ -410,9 +408,13 @@ class DeepAR(AutoRegressiveBaseModelWithCovariates):
             return_index=return_index,
             n_samples=n_samples,  # new keyword that is passed to forward function
             return_x=return_x,
-            show_progress_bar=show_progress_bar,
             fast_dev_run=fast_dev_run,
             num_workers=num_workers,
             batch_size=batch_size,
             mode_kwargs=mode_kwargs,
+            trainer_kwargs=trainer_kwargs,
+            write_interval=write_interval,
+            output_dir=output_dir,
+            return_y=return_y,
+            **kwargs,
         )

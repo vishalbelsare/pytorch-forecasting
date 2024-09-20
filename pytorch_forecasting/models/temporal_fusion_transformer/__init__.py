@@ -1,18 +1,17 @@
 """
 The temporal fusion transformer is a powerful predictive model for forecasting timeseries
 """
+
 from copy import copy
 from typing import Dict, List, Tuple, Union
 
-from matplotlib import pyplot as plt
 import numpy as np
 import torch
 from torch import nn
 from torchmetrics import Metric as LightningMetric
 
 from pytorch_forecasting.data import TimeSeriesDataSet
-from pytorch_forecasting.data.encoders import NaNLabelEncoder
-from pytorch_forecasting.metrics import MAE, MAPE, MASE, RMSE, SMAPE, MultiHorizonMetric, MultiLoss, QuantileLoss
+from pytorch_forecasting.metrics import MAE, MAPE, RMSE, SMAPE, MultiHorizonMetric, QuantileLoss
 from pytorch_forecasting.models.base_model import BaseModelWithCovariates
 from pytorch_forecasting.models.nn import LSTM, MultiEmbedding
 from pytorch_forecasting.models.temporal_fusion_transformer.sub_modules import (
@@ -23,7 +22,8 @@ from pytorch_forecasting.models.temporal_fusion_transformer.sub_modules import (
     InterpretableMultiHeadAttention,
     VariableSelectionNetwork,
 )
-from pytorch_forecasting.utils import autocorrelation, create_mask, detach, integer_histogram, padded_stack, to_list
+from pytorch_forecasting.utils import create_mask, detach, integer_histogram, masked_op, padded_stack, to_list
+from pytorch_forecasting.utils._dependencies import _check_matplotlib
 
 
 class TemporalFusionTransformer(BaseModelWithCovariates):
@@ -57,6 +57,7 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
         reduce_on_plateau_patience: int = 1000,
         monotone_constaints: Dict[str, int] = {},
         share_single_variable_networks: bool = False,
+        causal_attention: bool = True,
         logging_metrics: nn.ModuleList = None,
         **kwargs,
     ):
@@ -126,6 +127,8 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
                 This constraint significantly slows down training. Defaults to {}.
             share_single_variable_networks (bool): if to share the single variable networks between the encoder and
                 decoder. Defaults to False.
+            causal_attention (bool): If to attend only at previous timesteps in the decoder or also include future
+                predictions. Defaults to True.
             logging_metrics (nn.ModuleList[LightningMetric]): list of metrics that are logged during training.
                 Defaults to nn.ModuleList([SMAPE(), MAE(), RMSE(), MAPE()]).
             **kwargs: additional arguments to :py:class:`~BaseModel`.
@@ -159,7 +162,9 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
 
         # variable selection
         # variable selection for static variables
-        static_input_sizes = {name: self.hparams.embedding_sizes[name][1] for name in self.hparams.static_categoricals}
+        static_input_sizes = {
+            name: self.input_embeddings.output_size[name] for name in self.hparams.static_categoricals
+        }
         static_input_sizes.update(
             {
                 name: self.hparams.hidden_continuous_sizes.get(name, self.hparams.hidden_continuous_size)
@@ -176,7 +181,7 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
 
         # variable selection for encoder and decoder
         encoder_input_sizes = {
-            name: self.hparams.embedding_sizes[name][1] for name in self.hparams.time_varying_categoricals_encoder
+            name: self.input_embeddings.output_size[name] for name in self.hparams.time_varying_categoricals_encoder
         }
         encoder_input_sizes.update(
             {
@@ -186,7 +191,7 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
         )
 
         decoder_input_sizes = {
-            name: self.hparams.embedding_sizes[name][1] for name in self.hparams.time_varying_categoricals_decoder
+            name: self.input_embeddings.output_size[name] for name in self.hparams.time_varying_categoricals_decoder
         }
         decoder_input_sizes.update(
             {
@@ -221,9 +226,9 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
             dropout=self.hparams.dropout,
             context_size=self.hparams.hidden_size,
             prescalers=self.prescalers,
-            single_variable_grns={}
-            if not self.hparams.share_single_variable_networks
-            else self.shared_single_variable_grns,
+            single_variable_grns=(
+                {} if not self.hparams.share_single_variable_networks else self.shared_single_variable_grns
+            ),
         )
 
         self.decoder_variable_selection = VariableSelectionNetwork(
@@ -233,9 +238,9 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
             dropout=self.hparams.dropout,
             context_size=self.hparams.hidden_size,
             prescalers=self.prescalers,
-            single_variable_grns={}
-            if not self.hparams.share_single_variable_networks
-            else self.shared_single_variable_grns,
+            single_variable_grns=(
+                {} if not self.hparams.share_single_variable_networks else self.shared_single_variable_grns
+            ),
         )
 
         # static encoders
@@ -358,32 +363,33 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
         """
         return context[:, None].expand(-1, timesteps, -1)
 
-    def get_attention_mask(self, encoder_lengths: torch.LongTensor, decoder_length: int):
+    def get_attention_mask(self, encoder_lengths: torch.LongTensor, decoder_lengths: torch.LongTensor):
         """
         Returns causal mask to apply for self-attention layer.
-
-        Args:
-            self_attn_inputs: Inputs to self attention layer to determine mask shape
         """
-        # indices to which is attended
-        attend_step = torch.arange(decoder_length, device=self.device)
-        # indices for which is predicted
-        predict_step = torch.arange(0, decoder_length, device=self.device)[:, None]
-        # do not attend to steps to self or after prediction
-        # todo: there is potential value in attending to future forecasts if they are made with knowledge currently
-        #   available
-        #   one possibility is here to use a second attention layer for future attention (assuming different effects
-        #   matter in the future than the past)
-        #   or alternatively using the same layer but allowing forward attention - i.e. only masking out non-available
-        #   data and self
-        decoder_mask = attend_step >= predict_step
+        decoder_length = decoder_lengths.max()
+        if self.hparams.causal_attention:
+            # indices to which is attended
+            attend_step = torch.arange(decoder_length, device=self.device)
+            # indices for which is predicted
+            predict_step = torch.arange(0, decoder_length, device=self.device)[:, None]
+            # do not attend to steps to self or after prediction
+            decoder_mask = (attend_step >= predict_step).unsqueeze(0).expand(encoder_lengths.size(0), -1, -1)
+        else:
+            # there is value in attending to future forecasts if they are made with knowledge currently
+            #   available
+            #   one possibility is here to use a second attention layer for future attention (assuming different effects
+            #   matter in the future than the past)
+            #   or alternatively using the same layer but allowing forward attention - i.e. only
+            #   masking out non-available data and self
+            decoder_mask = create_mask(decoder_length, decoder_lengths).unsqueeze(1).expand(-1, decoder_length, -1)
         # do not attend to steps where data is padded
-        encoder_mask = create_mask(encoder_lengths.max(), encoder_lengths)
+        encoder_mask = create_mask(encoder_lengths.max(), encoder_lengths).unsqueeze(1).expand(-1, decoder_length, -1)
         # combine masks along attended time - first encoder and then decoder
         mask = torch.cat(
             (
-                encoder_mask.unsqueeze(1).expand(-1, decoder_length, -1),
-                decoder_mask.unsqueeze(0).expand(encoder_lengths.size(0), -1, -1),
+                encoder_mask,
+                decoder_mask,
             ),
             dim=2,
         )
@@ -479,9 +485,7 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
             q=attn_input[:, max_encoder_length:],  # query only for predictions
             k=attn_input,
             v=attn_input,
-            mask=self.get_attention_mask(
-                encoder_lengths=encoder_lengths, decoder_length=timesteps - max_encoder_length
-            ),
+            mask=self.get_attention_mask(encoder_lengths=encoder_lengths, decoder_lengths=decoder_lengths),
         )
 
         # skip connection over attention
@@ -499,7 +503,8 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
 
         return self.to_network_output(
             prediction=self.transform_output(output, target_scale=x["target_scale"]),
-            attention=attn_output_weights,
+            encoder_attention=attn_output_weights[..., :max_encoder_length],
+            decoder_attention=attn_output_weights[..., max_encoder_length:],
             static_variables=static_variable_selection,
             encoder_variables=encoder_sparse_weights,
             decoder_variables=decoder_sparse_weights,
@@ -526,11 +531,11 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
         )
         return interpretation
 
-    def epoch_end(self, outputs):
+    def on_epoch_end(self, outputs):
         """
         run at epoch end for training or validation
         """
-        if self.log_interval > 0:
+        if self.log_interval > 0 and not self.training:
             self.log_interpretation(outputs)
 
     def interpret_output(
@@ -538,7 +543,6 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
         out: Dict[str, torch.Tensor],
         reduction: str = "none",
         attention_prediction_horizon: int = 0,
-        attention_as_autocorrelation: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         interpret output of model
@@ -548,12 +552,81 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
             reduction: "none" for no averaging over batches, "sum" for summing attentions, "mean" for
                 normalizing by encode lengths
             attention_prediction_horizon: which prediction horizon to use for attention
-            attention_as_autocorrelation: if to record attention as autocorrelation - this should be set to true in
-                case of ``reduction != "none"`` and differing prediction times of the samples. Defaults to False
 
         Returns:
             interpretations that can be plotted with ``plot_interpretation()``
         """
+        # take attention and concatenate if a list to proper attention object
+        batch_size = len(out["decoder_attention"])
+        if isinstance(out["decoder_attention"], (list, tuple)):
+            # start with decoder attention
+            # assume issue is in last dimension, we need to find max
+            max_last_dimension = max(x.size(-1) for x in out["decoder_attention"])
+            first_elm = out["decoder_attention"][0]
+            # create new attention tensor into which we will scatter
+            decoder_attention = torch.full(
+                (batch_size, *first_elm.shape[:-1], max_last_dimension),
+                float("nan"),
+                dtype=first_elm.dtype,
+                device=first_elm.device,
+            )
+            # scatter into tensor
+            for idx, x in enumerate(out["decoder_attention"]):
+                decoder_length = out["decoder_lengths"][idx]
+                decoder_attention[idx, :, :, :decoder_length] = x[..., :decoder_length]
+        else:
+            decoder_attention = out["decoder_attention"].clone()
+            decoder_mask = create_mask(out["decoder_attention"].size(1), out["decoder_lengths"])
+            decoder_attention[decoder_mask[..., None, None].expand_as(decoder_attention)] = float("nan")
+
+        if isinstance(out["encoder_attention"], (list, tuple)):
+            # same game for encoder attention
+            # create new attention tensor into which we will scatter
+            first_elm = out["encoder_attention"][0]
+            encoder_attention = torch.full(
+                (batch_size, *first_elm.shape[:-1], self.hparams.max_encoder_length),
+                float("nan"),
+                dtype=first_elm.dtype,
+                device=first_elm.device,
+            )
+            # scatter into tensor
+            for idx, x in enumerate(out["encoder_attention"]):
+                encoder_length = out["encoder_lengths"][idx]
+                encoder_attention[idx, :, :, self.hparams.max_encoder_length - encoder_length :] = x[
+                    ..., :encoder_length
+                ]
+        else:
+            # roll encoder attention (so start last encoder value is on the right)
+            encoder_attention = out["encoder_attention"].clone()
+            shifts = encoder_attention.size(3) - out["encoder_lengths"]
+            new_index = (
+                torch.arange(encoder_attention.size(3), device=encoder_attention.device)[None, None, None].expand_as(
+                    encoder_attention
+                )
+                - shifts[:, None, None, None]
+            ) % encoder_attention.size(3)
+            encoder_attention = torch.gather(encoder_attention, dim=3, index=new_index)
+            # expand encoder_attentiont to full size
+            if encoder_attention.size(-1) < self.hparams.max_encoder_length:
+                encoder_attention = torch.concat(
+                    [
+                        torch.full(
+                            (
+                                *encoder_attention.shape[:-1],
+                                self.hparams.max_encoder_length - out["encoder_lengths"].max(),
+                            ),
+                            float("nan"),
+                            dtype=encoder_attention.dtype,
+                            device=encoder_attention.device,
+                        ),
+                        encoder_attention,
+                    ],
+                    dim=-1,
+                )
+
+        # combine attention vector
+        attention = torch.concat([encoder_attention, decoder_attention], dim=-1)
+        attention[attention < 1e-5] = float("nan")
 
         # histogram of decode and encode lengths
         encoder_length_histogram = integer_histogram(out["encoder_lengths"], min=0, max=self.hparams.max_encoder_length)
@@ -562,7 +635,7 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
         )
 
         # mask where decoder and encoder where not applied when averaging variable selection weights
-        encoder_variables = out["encoder_variables"].squeeze(-2)
+        encoder_variables = out["encoder_variables"].squeeze(-2).clone()
         encode_mask = create_mask(encoder_variables.size(1), out["encoder_lengths"])
         encoder_variables = encoder_variables.masked_fill(encode_mask.unsqueeze(-1), 0.0).sum(dim=1)
         encoder_variables /= (
@@ -571,7 +644,7 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
             .unsqueeze(-1)
         )
 
-        decoder_variables = out["decoder_variables"].squeeze(-2)
+        decoder_variables = out["decoder_variables"].squeeze(-2).clone()
         decode_mask = create_mask(decoder_variables.size(1), out["decoder_lengths"])
         decoder_variables = decoder_variables.masked_fill(decode_mask.unsqueeze(-1), 0.0).sum(dim=1)
         decoder_variables /= out["decoder_lengths"].unsqueeze(-1)
@@ -580,53 +653,25 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
         static_variables = out["static_variables"].squeeze(1)
         # attention is batch x time x heads x time_to_attend
         # average over heads + only keep prediction attention and attention on observed timesteps
-        attention = out["attention"][
-            :, attention_prediction_horizon, :, : out["encoder_lengths"].max() + attention_prediction_horizon
-        ].mean(1)
+        attention = masked_op(
+            attention[
+                :, attention_prediction_horizon, :, : self.hparams.max_encoder_length + attention_prediction_horizon
+            ],
+            op="mean",
+            dim=1,
+        )
 
         if reduction != "none":  # if to average over batches
             static_variables = static_variables.sum(dim=0)
             encoder_variables = encoder_variables.sum(dim=0)
             decoder_variables = decoder_variables.sum(dim=0)
 
-            # reorder attention or averaging
-            for i in range(len(attention)):  # very inefficient but does the trick
-                if 0 < out["encoder_lengths"][i] < attention.size(1) - attention_prediction_horizon - 1:
-                    relevant_attention = attention[
-                        i, : out["encoder_lengths"][i] + attention_prediction_horizon
-                    ].clone()
-                    if attention_as_autocorrelation:
-                        relevant_attention = autocorrelation(relevant_attention)
-                    attention[i, -out["encoder_lengths"][i] - attention_prediction_horizon :] = relevant_attention
-                    attention[i, : attention.size(1) - out["encoder_lengths"][i] - attention_prediction_horizon] = 0.0
-                elif attention_as_autocorrelation:
-                    attention[i] = autocorrelation(attention[i])
-
-            attention = attention.sum(dim=0)
-            if reduction == "mean":
-                attention = attention / encoder_length_histogram[1:].flip(0).cumsum(0).clamp(1)
-                attention = attention / attention.sum(-1).unsqueeze(-1)  # renormalize
-            elif reduction == "sum":
-                pass
-            else:
-                raise ValueError(f"Unknown reduction {reduction}")
-
-            attention = torch.zeros(
-                self.hparams.max_encoder_length + attention_prediction_horizon, device=self.device
-            ).scatter(
-                dim=0,
-                index=torch.arange(
-                    self.hparams.max_encoder_length + attention_prediction_horizon - attention.size(-1),
-                    self.hparams.max_encoder_length + attention_prediction_horizon,
-                    device=self.device,
-                ),
-                src=attention,
-            )
+            attention = masked_op(attention, dim=0, op=reduction)
         else:
-            attention = attention / attention.sum(-1).unsqueeze(-1)  # renormalize
+            attention = attention / masked_op(attention, dim=1, op="sum").unsqueeze(-1)  # renormalize
 
         interpretation = dict(
-            attention=attention,
+            attention=attention.masked_fill(torch.isnan(attention), 0.0),
             static_variables=static_variables,
             encoder_variables=encoder_variables,
             decoder_variables=decoder_variables,
@@ -645,7 +690,7 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
         show_future_observed: bool = True,
         ax=None,
         **kwargs,
-    ) -> plt.Figure:
+    ):
         """
         Plot actuals vs prediction and attention
 
@@ -661,7 +706,6 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
         Returns:
             plt.Figure: matplotlib figure
         """
-
         # plot prediction as normal
         fig = super().plot_prediction(
             x,
@@ -675,22 +719,22 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
 
         # add attention on secondary axis
         if plot_attention:
-            interpretation = self.interpret_output(out)
+            interpretation = self.interpret_output(out.iget(slice(idx, idx + 1)))
             for f in to_list(fig):
                 ax = f.axes[0]
                 ax2 = ax.twinx()
                 ax2.set_ylabel("Attention")
-                encoder_length = x["encoder_lengths"][idx]
+                encoder_length = x["encoder_lengths"][0]
                 ax2.plot(
                     torch.arange(-encoder_length, 0),
-                    interpretation["attention"][idx, :encoder_length].detach().cpu(),
+                    interpretation["attention"][0, -encoder_length:].detach().cpu(),
                     alpha=0.2,
                     color="k",
                 )
                 f.tight_layout()
         return fig
 
-    def plot_interpretation(self, interpretation: Dict[str, torch.Tensor]) -> Dict[str, plt.Figure]:
+    def plot_interpretation(self, interpretation: Dict[str, torch.Tensor]):
         """
         Make figures that interpret model.
 
@@ -703,6 +747,10 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
         Returns:
             dictionary of matplotlib figures
         """
+        _check_matplotlib("plot_interpretation")
+
+        import matplotlib.pyplot as plt
+
         figs = {}
 
         # attention
@@ -752,7 +800,7 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
         }
         # normalize attention with length histogram squared to account for: 1. zeros in attention and
         # 2. higher attention due to less values
-        attention_occurances = interpretation["encoder_length_histogram"][1:].flip(0).cumsum(0).float()
+        attention_occurances = interpretation["encoder_length_histogram"][1:].flip(0).float().cumsum(0)
         attention_occurances = attention_occurances / attention_occurances.max()
         attention_occurances = torch.cat(
             [
@@ -767,6 +815,13 @@ class TemporalFusionTransformer(BaseModelWithCovariates):
         )
         interpretation["attention"] = interpretation["attention"] / attention_occurances.pow(2).clamp(1.0)
         interpretation["attention"] = interpretation["attention"] / interpretation["attention"].sum()
+
+        mpl_available = _check_matplotlib("log_interpretation", raise_error=False)
+
+        if not mpl_available:
+            return None
+
+        import matplotlib.pyplot as plt
 
         figs = self.plot_interpretation(interpretation)  # make interpretation figures
         label = self.current_stage

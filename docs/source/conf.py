@@ -142,9 +142,11 @@ mathjax_path = "https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.5/MathJax.js?
 # theme options
 html_theme_options = {
     "github_url": "https://github.com/jdb78/pytorch-forecasting",
+    "navbar_end": ["navbar-icon-links.html", "search-field.html"],
+    "show_nav_level": 2,
+    "header_links_before_dropdown": 10,
+    "external_links": [{"name": "GitHub", "url": "https://github.com/jdb78/pytorch-forecasting"}],
 }
-
-html_theme_options = {"navbar_end": ["navbar-icon-links.html", "search-field.html"]}
 
 html_sidebars = {
     "index": [],
@@ -170,3 +172,11 @@ shutil.copy(
     "../../CHANGELOG.md",
     "CHANGELOG.md",
 )
+
+intersphinx_mapping = {
+    "sklearn": ("https://scikit-learn.org/stable/", None),
+}
+
+suppress_warnings = [
+    "autosummary.import_cycle",
+]

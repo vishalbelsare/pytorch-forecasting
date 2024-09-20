@@ -1,9 +1,9 @@
 """
 N-Beats model for timeseries forecasting without covariates.
 """
+
 from typing import Dict, List
 
-import matplotlib.pyplot as plt
 import torch
 from torch import nn
 
@@ -12,6 +12,7 @@ from pytorch_forecasting.data.encoders import NaNLabelEncoder
 from pytorch_forecasting.metrics import MAE, MAPE, MASE, RMSE, SMAPE, MultiHorizonMetric
 from pytorch_forecasting.models.base_model import BaseModel
 from pytorch_forecasting.models.nbeats.sub_modules import NBEATSGenericBlock, NBEATSSeasonalBlock, NBEATSTrendBlock
+from pytorch_forecasting.utils._dependencies import _check_matplotlib
 
 
 class NBeats(BaseModel):
@@ -47,6 +48,9 @@ class NBeats(BaseModel):
         including ensembles of traditional statical methods in the M4 competition. The M4 competition is arguably
         the most
         important benchmark for univariate time series forecasting.
+
+        The :py:class:`~pytorch_forecasting.models.nhits.NHiTS` network has recently shown to consistently outperform
+        N-BEATS.
 
         Args:
             stack_types: One of the following values: “generic”, “seasonality" or “trend". A list of strings
@@ -224,7 +228,7 @@ class NBeats(BaseModel):
         """
         log, out = super().step(x, y, batch_idx=batch_idx)
 
-        if self.hparams.backcast_loss_ratio > 0:  # add loss from backcast
+        if self.hparams.backcast_loss_ratio > 0 and not self.predicting:  # add loss from backcast
             backcast = out["backcast"]
             backcast_weight = (
                 self.hparams.backcast_loss_ratio * self.hparams.prediction_length / self.hparams.context_length
@@ -259,6 +263,11 @@ class NBeats(BaseModel):
         """
         Log interpretation of network predictions in tensorboard.
         """
+        mpl_available = _check_matplotlib("log_interpretation", raise_error=False)
+
+        if not mpl_available:
+            return None
+
         label = ["val", "train"][self.training]
         if self.log_interval > 0 and batch_idx % self.log_interval == 0:
             fig = self.plot_interpretation(x, out, idx=0)
@@ -276,7 +285,7 @@ class NBeats(BaseModel):
         idx: int,
         ax=None,
         plot_seasonality_and_generic_on_secondary_axis: bool = False,
-    ) -> plt.Figure:
+    ):
         """
         Plot interpretation.
 
@@ -295,6 +304,10 @@ class NBeats(BaseModel):
         Returns:
             plt.Figure: matplotlib figure
         """
+        _check_matplotlib("plot_interpretation")
+
+        import matplotlib.pyplot as plt
+
         if ax is None:
             fig, ax = plt.subplots(2, 1, figsize=(6, 8))
         else:

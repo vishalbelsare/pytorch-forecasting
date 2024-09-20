@@ -1,20 +1,124 @@
 # Release Notes
 
-## v0.9.3 UNRELEASED
+## v1.1.1
+
+Hotfix for accidental package name change in `pyproject.toml`.
+
+The package name is now corrected to `pytorch-forecasting`.
+
+
+## v1.1.0
+
+Maintenance update widening compatibility ranges and consolidating dependencies:
+
+* support for python 3.11 and 3.12, added CI testing
+* support for MacOS, added CI testing
+* core dependencies have been minimized to `numpy`, `torch`, `lightning`, `scipy`, `pandas`, and `scikit-learn`.
+* soft dependencies are available in soft dependency sets: `all_extras` for all soft dependencies, and `tuning` for `optuna` based optimization.
+
+### Dependency changes
+
+* the following are no longer core dependencies and have been changed to optional dependencies : `optuna`, `statsmodels`, `pytorch-optimize`, `matplotlib`. Environments relying on functionality requiring these dependencies need to be updated to instlal these explicitly.
+* `optuna` bounds have been updated to `optuna >=3.1.0,<4.0.0`
+* `optuna-integrate` is now an additional soft dependency, in case of `optuna >=3.3.0`
+
+### Deprecations and removals
+
+* from 1.2.0, the default optimizer will be changed from `"ranger"` to `"adam"` to avoid non-`torch` dependencies in defaults. `pytorch-optimize` optimizers can still be used. Users should set the optimizer explicitly to continue using `"ranger"`.
+*  from 1.1.0, the loggers do not log figures if soft dependency `matplotlib` is not present, but will raise no exceptions in this case. To log figures, ensure tha `matplotlib` is installed.
+
+## v1.0.0 Update to pytorch 2.0 (10/04/2023)
+
+
+### Breaking Changes
+
+- Upgraded to pytorch 2.0 and lightning 2.0. This brings a couple of changes, such as configuration of trainers. See the [lightning upgrade guide](https://lightning.ai/docs/pytorch/latest/upgrade/migration_guide.html). For PyTorch Forecasting, this particularly means if you are developing own models, the class method `epoch_end` has been renamed to `on_epoch_end` and replacing `model.summarize()` with `ModelSummary(model, max_depth=-1)` and `Tuner(trainer)` is its own class, so `trainer.tuner` needs replacing. (#1280)
+- Changed the `predict()` interface returning named tuple - see tutorials.
+
+### Changes
+
+- The predict method is now using the lightning predict functionality and allows writing results to disk (#1280).
+
+### Fixed
+
+- Fixed robust scaler when quantiles are 0.0, and 1.0, i.e. minimum and maximum (#1142)
+
+## v0.10.3 Poetry update (07/09/2022)
+
+### Fixed
+
+- Removed pandoc from dependencies as issue with poetry install (#1126)
+- Added metric attributes for torchmetric resulting in better multi-GPU performance (#1126)
 
 ### Added
 
-- Allow using [torchmetrics](https://torchmetrics.readthedocs.io/) as loss metrics (#776)
+- "robust" encoder method can be customized by setting "center", "lower" and "upper" quantiles (#1126)
+
+## v0.10.2 Multivariate networks (23/05/2022)
+
+### Added
+
+- DeepVar network (#923)
+- Enable quantile loss for N-HiTS (#926)
+- MQF2 loss (multivariate quantile loss) (#949)
+- Non-causal attention for TFT (#949)
+- Tweedie loss (#949)
+- ImplicitQuantileNetworkDistributionLoss (#995)
+
+### Fixed
+
+- Fix learning scale schedule (#912)
+- Fix TFT list/tuple issue at interpretation (#924)
+- Allowed encoder length down to zero for EncoderNormalizer if transformation is not needed (#949)
+- Fix Aggregation and CompositeMetric resets (#949)
+
+### Changed
+
+- Dropping Python 3.6 suppport, adding 3.10 support (#479)
+- Refactored dataloader sampling - moved samplers to pytorch_forecasting.data.samplers module (#479)
+- Changed transformation format for Encoders to dict from tuple (#949)
 
 ### Contributors
 
 - jdb78
 
+## v0.10.1 Bugfixes (24/03/2022)
+
+### Fixed
+
+- Fix with creating tensors on correct devices (#908)
+- Fix with MultiLoss when calculating gradient (#908)
+
+### Contributors
+
+- jdb78
+
+## v0.10.0 Adding N-HiTS network (N-BEATS successor) (23/03/2022)
+
+### Added
+
+- Added new `N-HiTS` network that has consistently beaten `N-BEATS` (#890)
+- Allow using [torchmetrics](https://torchmetrics.readthedocs.io/) as loss metrics (#776)
+- Enable fitting `EncoderNormalizer()` with limited data history using `max_length` argument (#782)
+- More flexible `MultiEmbedding()` with convenience `output_size` and `input_size` properties (#829)
+- Fix concatentation of attention (#902)
+
+### Fixed
+
+- Fix pip install via github (#798)
+
+### Contributors
+
+- jdb78
+- christy
+- lukemerrick
+- Seon82
+
 ## v0.9.2 Maintenance Release (30/11/2021)
 
 ### Added
 
-- Added support for running `pytorch_lightning.trainer.test` (#759)
+- Added support for running `lightning.trainer.test` (#759)
 
 ### Fixed
 
@@ -335,7 +439,7 @@ This release has only one purpose: Allow usage of PyTorch Lightning 1.0 - all te
   - Using `LearningRateMonitor` instead of `LearningRateLogger`
   - Use `EarlyStopping` callback in trainer `callbacks` instead of `early_stopping` argument
   - Update metric system `update()` and `compute()` methods
-  - Use `trainer.tuner.lr_find()` instead of `trainer.lr_find()` in tutorials and examples
+  - Use `Tuner(trainer).lr_find()` instead of `trainer.lr_find()` in tutorials and examples
 - Update poetry to 1.1.0
 
 ---
@@ -439,7 +543,7 @@ Fix bug where predictions were not correctly logged in case of `decoder_length =
 
 ## v0.2.3 Make pip installable from master branch (23/08/2020)
 
-Update build system requirements to be parsed correctly when installing with `pip install https://github.com/jdb78/pytorch-forecasting/`
+Update build system requirements to be parsed correctly when installing with `pip install git+https://github.com/jdb78/pytorch-forecasting`
 
 ---
 

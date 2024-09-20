@@ -1,13 +1,14 @@
 """
 Example datasets for tutorials and testing.
 """
+
 from pathlib import Path
+from urllib.request import urlretrieve
 
 import numpy as np
 import pandas as pd
-import requests
 
-BASE_URL = "https://raw.github.com/jdb78/pytorch-forecasting/master/examples/data/"
+BASE_URL = "https://github.com/jdb78/pytorch-forecasting/raw/master/examples/data/"
 
 DATA_PATH = Path(__file__).parent
 
@@ -27,9 +28,7 @@ def _get_data_by_filename(fname: str) -> Path:
     # check if file exists - download if necessary
     if not full_fname.exists():
         url = BASE_URL + fname
-        download = requests.get(url, allow_redirects=True)
-        with open(full_fname, "wb") as file:
-            file.write(download.content)
+        urlretrieve(url, full_fname)
 
     return full_fname
 
@@ -87,13 +86,13 @@ def generate_ar_data(
     # sample parameters
     np.random.seed(seed)
     linear_trends = np.random.normal(size=n_series)[:, None] / timesteps
-    quadratic_trends = np.random.normal(size=n_series)[:, None] / timesteps ** 2
+    quadratic_trends = np.random.normal(size=n_series)[:, None] / timesteps**2
     seasonalities = np.random.normal(size=n_series)[:, None]
     levels = level * np.random.normal(size=n_series)[:, None]
 
     # generate series
     x = np.arange(timesteps)[None, :]
-    series = (x * linear_trends + x ** 2 * quadratic_trends) * trend + seasonalities * np.sin(
+    series = (x * linear_trends + x**2 * quadratic_trends) * trend + seasonalities * np.sin(
         2 * np.pi * seasonality * x / timesteps
     )
     # add noise

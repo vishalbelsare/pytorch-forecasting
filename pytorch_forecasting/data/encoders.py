@@ -1,19 +1,212 @@
 """
 Encoders for encoding categorical variables and scaling continuous data.
 """
-from typing import Callable, Dict, Iterable, List, Tuple, Union
+
+from typing import Any, Callable, Dict, Iterable, List, Tuple, Union
 import warnings
 
 import numpy as np
 import pandas as pd
-from pandas.core.algorithms import isin
 from sklearn.base import BaseEstimator, TransformerMixin
 import torch
+from torch.distributions import constraints
+from torch.distributions.transforms import ExpTransform, PowerTransform, SigmoidTransform, Transform, _clipped_sigmoid
 import torch.nn.functional as F
 from torch.nn.utils import rnn
 
+from pytorch_forecasting.utils import InitialParameterRepresenterMixIn
 
-class NaNLabelEncoder(BaseEstimator, TransformerMixin):
+
+def _plus_one(x):
+    return x + 1
+
+
+def _minus_one(x):
+    return x - 1
+
+
+def _identity(x):
+    return x
+
+
+def _clipped_logit(x):
+    finfo = torch.finfo(x.dtype)
+    x = x.clamp(min=finfo.eps, max=1.0 - finfo.eps)
+    return x.log() - (-x).log1p()
+
+
+def softplus_inv(y):
+    finfo = torch.finfo(y.dtype)
+    return y.where(y > 20.0, y + (y + finfo.eps).neg().expm1().neg().log())
+
+
+def _square(y):
+    return torch.pow(y, 2.0)
+
+
+def _clipped_log(y):
+    finfo = torch.finfo(y.dtype)
+    return y.log().clamp(min=-1 / finfo.eps)
+
+
+class SoftplusTransform(Transform):
+    r"""
+    Transform via the mapping :math:`\text{Softplus}(x) = \log(1 + \exp(x))`.
+    The implementation reverts to the linear function when :math:`x > 20`.
+    """
+
+    domain = constraints.real
+    codomain = constraints.positive
+    bijective = True
+    sign = +1
+
+    def __eq__(self, other):
+        return isinstance(other, SoftplusTransform)
+
+    def _call(self, x):
+        return F.softplus(x)
+
+    def _inverse(self, y):
+        return softplus_inv(y)
+
+    def log_abs_det_jacobian(self, x, y):
+        return -F.softplus(-x)
+
+
+class Expm1Transform(ExpTransform):
+    codomain = constraints.greater_than_eq(-1.0)
+
+    def _call(self, x):
+        return super()._call(x) - 1.0
+
+    def _inverse(self, y):
+        return super()._inverse(y + 1.0)
+
+
+class MinusOneTransform(Transform):
+    r"""
+    Transform x -> x - 1.
+    """
+
+    domain = constraints.real
+    codomain = constraints.real
+    sign: int = 1
+    bijective: bool = True
+
+    def _call(self, x):
+        return x - 1.0
+
+    def _inverse(self, y):
+        return y + 1.0
+
+    def log_abs_det_jacobian(self, x, y):
+        return 0.0
+
+
+class ReLuTransform(Transform):
+    r"""
+    Transform x -> max(0, x).
+    """
+
+    domain = constraints.real
+    codomain = constraints.nonnegative
+    sign: int = 1
+    bijective: bool = False
+
+    def _call(self, x):
+        return F.relu(x)
+
+    def _inverse(self, y):
+        return y
+
+    def log_abs_det_jacobian(self, x, y):
+        return 0.0
+
+
+class TransformMixIn:
+    """Mixin for providing pre- and post-processing capabilities to encoders.
+
+    Class should have a ``transformation`` attribute to indicate how to preprocess data.
+    """
+
+    # dict of PyTorch functions that transforms and inversely transforms values.
+    # inverse entry required if "reverse" is not the "inverse" of "forward".
+    TRANSFORMATIONS = {
+        "log": dict(forward=_clipped_log, reverse=torch.exp, inverse_torch=ExpTransform()),
+        "log1p": dict(forward=torch.log1p, reverse=torch.exp, inverse=torch.expm1, inverse_torch=Expm1Transform()),
+        "logit": dict(forward=_clipped_logit, reverse=_clipped_sigmoid, inverse_torch=SigmoidTransform()),
+        "count": dict(forward=_plus_one, reverse=F.softplus, inverse=_minus_one, inverse_torch=MinusOneTransform()),
+        "softplus": dict(forward=softplus_inv, reverse=F.softplus, inverse_torch=SoftplusTransform()),
+        "relu": dict(forward=_identity, reverse=F.relu, inverse=_identity, inverse_torch=ReLuTransform()),
+        "sqrt": dict(forward=torch.sqrt, reverse=_square, inverse_torch=PowerTransform(exponent=2.0)),
+    }
+
+    @classmethod
+    def get_transform(cls, transformation: Union[str, Dict[str, Callable]]) -> Dict[str, Callable]:
+        """Return transformation functions.
+
+        Args:
+            transformation (Union[str, Dict[str, Callable]]): name of transformation or
+                dictionary with transformation information.
+
+        Returns:
+            Dict[str, Callable]: dictionary with transformation functions (forward, reverse, inverse and inverse_torch)
+        """
+        if isinstance(transformation, str):
+            transform = cls.TRANSFORMATIONS[transformation]
+        else:
+            transform = transformation
+        transform.setdefault("forward", _identity)
+        transform.setdefault("reverse", _identity)
+        return transform
+
+    def preprocess(
+        self, y: Union[pd.Series, pd.DataFrame, np.ndarray, torch.Tensor]
+    ) -> Union[np.ndarray, torch.Tensor]:
+        """
+        Preprocess input data (e.g. take log).
+
+        Uses ``transform`` attribute to determine how to apply transform.
+
+        Returns:
+            Union[np.ndarray, torch.Tensor]: return rescaled series with type depending on input type
+        """
+        if self.transformation is None:
+            return y
+
+        if isinstance(y, torch.Tensor):
+            y = self.get_transform(self.transformation)["forward"](y)
+        else:
+            # convert first to tensor, then transform and then convert to numpy array
+            if isinstance(y, (pd.Series, pd.DataFrame)):
+                y = y.to_numpy()
+            y = torch.as_tensor(y)
+            y = self.get_transform(self.transformation)["forward"](y)
+            y = np.asarray(y)
+        return y
+
+    def inverse_preprocess(self, y: Union[pd.Series, np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
+        """
+        Inverse preprocess re-scaled data (e.g. take exp).
+
+        Uses ``transform`` attribute to determine how to apply inverse transform.
+
+        Returns:
+            Union[np.ndarray, torch.Tensor]: return rescaled series with type depending on input type
+        """
+        if self.transformation is None:
+            pass
+        elif isinstance(y, torch.Tensor):
+            y = self.get_transform(self.transformation)["reverse"](y)
+        else:
+            # convert first to tensor, then transform and then convert to numpy array
+            y = torch.as_tensor(y)
+            y = self.get_transform(self.transformation)["reverse"](y)
+            y = np.asarray(y)
+        return y
+
+
+class NaNLabelEncoder(InitialParameterRepresenterMixIn, BaseEstimator, TransformerMixin, TransformMixIn):
     """
     Labelencoder that can optionally always encode nan and unknown classes (in transform) as class ``0``
     """
@@ -56,7 +249,9 @@ class NaNLabelEncoder(BaseEstimator, TransformerMixin):
         Returns:
             bool: True if series is numeric
         """
-        return y.dtype.kind in "bcif" or (isinstance(y, pd.CategoricalDtype) and y.cat.categories.dtype.kind in "bcif")
+        return y.dtype.kind in "bcif" or (
+            isinstance(y.dtype, pd.CategoricalDtype) and y.cat.categories.dtype.kind in "bcif"
+        )
 
     def fit(self, y: pd.Series, overwrite: bool = False):
         """
@@ -165,7 +360,7 @@ class NaNLabelEncoder(BaseEstimator, TransformerMixin):
         decoded = self.classes_vector_[y]
         return decoded
 
-    def __call__(self, data: (Dict[str, torch.Tensor])) -> torch.Tensor:
+    def __call__(self, data: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         Extract prediction from network output. Does not map back to input
         categories as this would require a numpy tensor without grad-abilities.
@@ -191,67 +386,48 @@ class NaNLabelEncoder(BaseEstimator, TransformerMixin):
         return np.zeros(2, dtype=np.float64)
 
 
-def _plus_one(x):
-    return x + 1
-
-
-def _identity(x):
-    return x
-
-
-def _clamp_zero(x):
-    return x.clamp(0.0)
-
-
-class TorchNormalizer(BaseEstimator, TransformerMixin):
+class TorchNormalizer(InitialParameterRepresenterMixIn, BaseEstimator, TransformerMixin, TransformMixIn):
     """
     Basic target transformer that can be fit also on torch tensors.
     """
-
-    # transformation and inverse transformation
-    TRANSFORMATIONS = {
-        "log": (torch.log, torch.exp),
-        "log1p": (torch.log1p, torch.exp),
-        "logit": (torch.logit, torch.sigmoid),
-        "softplus": (_plus_one, F.softplus),
-        "relu": (_identity, _clamp_zero),
-    }
 
     def __init__(
         self,
         method: str = "standard",
         center: bool = True,
         transformation: Union[str, Tuple[Callable, Callable]] = None,
-        eps: float = 1e-8,
+        method_kwargs: Dict[str, Any] = {},
     ):
         """
-        Initialize
-
         Args:
             method (str, optional): method to rescale series. Either "identity", "standard" (standard scaling)
                 or "robust" (scale using quantiles 0.25-0.75). Defaults to "standard".
+            method_kwargs (Dict[str, Any], optional): Dictionary of method specific arguments as listed below
+                * "robust" method: "upper", "lower", "center" quantiles defaulting to 0.75, 0.25 and 0.5
             center (bool, optional): If to center the output to zero. Defaults to True.
-            transformation (Union[str, Tuple[Callable, Callable]] optional): Transform values before
+            transformation (Union[str, Dict[str, Callable]] optional): Transform values before
                 applying normalizer. Available options are
 
                 * None (default): No transformation of values
                 * log: Estimate in log-space leading to a multiplicative model
-                * logp1: Estimate in log-space but add 1 to values before transforming for stability
-                    (e.g. if many small values <<1 are present).
-                    Note, that inverse transform is still only `torch.exp()` and not `torch.expm1()`.
+                * log1p: Estimate in log-space but add 1 to values before transforming for stability
+                  (e.g. if many small values <<1 are present).
+                  Note, that inverse transform is still only `torch.exp()` and not `torch.expm1()`.
                 * logit: Apply logit transformation on values that are between 0 and 1
-                * softplus: Apply softplus to output (inverse transformation) and x + 1 to input (transformation)
+                * count: Apply softplus to output (inverse transformation) and x + 1 to input (transformation)
+                * softplus: Apply softplus to output (inverse transformation) and inverse softplus to input
+                    (transformation)
                 * relu: Apply max(0, x) to output
-                * Tuple[Callable, Callable] of PyTorch functions that transforms and inversely transforms values.
-
-            eps (float, optional): Number for numerical stability of calculations.
-                Defaults to 1e-8.
+                * Dict[str, Callable] of PyTorch functions that transforms and inversely transforms values.
+                  ``forward`` and ``reverse`` entries are required. ``inverse`` transformation is optional and
+                  should be defined if ``reverse`` is not the inverse of the forward transformation. ``inverse_torch``
+                  can be defined to provide a torch distribution transform for inverse transformations.
         """
         self.method = method
         assert method in ["standard", "robust", "identity"], f"method has invalid value {method}"
         self.center = center
-        self.eps = eps
         self.transformation = transformation
+        self.method_kwargs = method_kwargs
 
     def get_parameters(self, *args, **kwargs) -> torch.Tensor:
         """
@@ -261,58 +437,6 @@ class TorchNormalizer(BaseEstimator, TransformerMixin):
             torch.Tensor: First element is center of data and second is scale
         """
         return torch.stack([torch.as_tensor(self.center_), torch.as_tensor(self.scale_)], dim=-1)
-
-    def preprocess(
-        self, y: Union[pd.Series, pd.DataFrame, np.ndarray, torch.Tensor]
-    ) -> Union[np.ndarray, torch.Tensor]:
-        """
-        Preprocess input data (e.g. take log).
-
-        Uses ``transform`` attribute to determine how to apply transform.
-
-        Returns:
-            Union[np.ndarray, torch.Tensor]: return rescaled series with type depending on input type
-        """
-        if self.transformation is None:
-            return y
-
-        # protect against numerical instabilities
-        if isinstance(self.transformation, str) and self.transformation == "logit":
-            # need to apply eps slightly differently
-            y = y / (1 + 2 * self.eps) + self.eps
-        else:
-            y = y + self.eps
-
-        if isinstance(y, torch.Tensor):
-            y = self.TRANSFORMATIONS.get(self.transformation, self.transformation)[0](y)
-        else:
-            # convert first to tensor, then transform and then convert to numpy array
-            if isinstance(y, (pd.Series, pd.DataFrame)):
-                y = y.to_numpy()
-            y = torch.as_tensor(y)
-            y = self.TRANSFORMATIONS.get(self.transformation, self.transformation)[0](y)
-            y = np.asarray(y)
-        return y
-
-    def inverse_preprocess(self, y: Union[pd.Series, np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
-        """
-        Inverse preprocess re-scaled data (e.g. take exp).
-
-        Uses ``transform`` attribute to determine how to apply inverse transform.
-
-        Returns:
-            Union[np.ndarray, torch.Tensor]: return rescaled series with type depending on input type
-        """
-        if self.transformation is None:
-            pass
-        elif isinstance(y, torch.Tensor):
-            y = self.TRANSFORMATIONS.get(self.transformation, self.transformation)[1](y)
-        else:
-            # convert first to tensor, then transform and then convert to numpy array
-            y = torch.as_tensor(y)
-            y = self.TRANSFORMATIONS.get(self.transformation, self.transformation)[1](y)
-            y = np.asarray(y)
-        return y
 
     def fit(self, y: Union[pd.Series, np.ndarray, torch.Tensor]):
         """
@@ -325,46 +449,68 @@ class TorchNormalizer(BaseEstimator, TransformerMixin):
             TorchNormalizer: self
         """
         y = self.preprocess(y)
+        self._set_parameters(y_center=y, y_scale=y)
+        return self
 
+    def _set_parameters(
+        self, y_center: Union[pd.Series, np.ndarray, torch.Tensor], y_scale: Union[pd.Series, np.ndarray, torch.Tensor]
+    ):
+        """
+        Calculate parameters for scale and center based on input timeseries
+
+        Args:
+            y_center (Union[pd.Series, np.ndarray, torch.Tensor]): timeseries for calculating center
+            y_scale (Union[pd.Series, np.ndarray, torch.Tensor]): timeseries for calculating scale
+        """
+        if isinstance(y_center, torch.Tensor):
+            eps = torch.finfo(y_center.dtype).eps
+        else:
+            eps = np.finfo(np.float16).eps
         if self.method == "identity":
-            if isinstance(y, torch.Tensor):
-                self.center_ = torch.zeros(y.size()[:-1])
-                self.scale_ = torch.ones(y.size()[:-1])
-            elif isinstance(y, (np.ndarray, pd.Series, pd.DataFrame)):
-                self.center_ = np.zeros(y.shape[:-1])
-                self.scale_ = np.ones(y.shape[:-1])
+            if isinstance(y_center, torch.Tensor):
+                self.center_ = torch.zeros(y_center.size()[:-1])
+                self.scale_ = torch.ones(y_scale.size()[:-1])
+            elif isinstance(y_center, (np.ndarray, pd.Series, pd.DataFrame)):
+                # numpy default type is numpy.float64 while torch default type is torch.float32 (if not changed)
+                # therefore, we first generate torch tensors (with torch default type) and then
+                # convert them to numpy arrays
+                self.center_ = torch.zeros(y_center.shape[:-1]).numpy()
+                self.scale_ = torch.ones(y_scale.shape[:-1]).numpy()
             else:
                 self.center_ = 0.0
                 self.scale_ = 1.0
 
         elif self.method == "standard":
-            if isinstance(y, torch.Tensor):
-                self.center_ = torch.mean(y, dim=-1)
-                self.scale_ = torch.std(y, dim=-1) + self.eps
-            elif isinstance(y, np.ndarray):
-                self.center_ = np.mean(y, axis=-1)
-                self.scale_ = np.std(y, axis=-1) + self.eps
+            if isinstance(y_center, torch.Tensor):
+                self.center_ = torch.mean(y_center, dim=-1)
+                self.scale_ = torch.std(y_scale, dim=-1) + eps
+            elif isinstance(y_center, np.ndarray):
+                self.center_ = np.mean(y_center, axis=-1)
+                self.scale_ = np.std(y_scale, axis=-1) + eps
             else:
-                self.center_ = np.mean(y)
-                self.scale_ = np.std(y) + self.eps
+                self.center_ = np.mean(y_center)
+                self.scale_ = np.std(y_scale) + eps
+            # correct numpy scalar dtype promotion, e.g. fix type from `np.float32(0.0) + 1e-8` gives `np.float64(1e-8)`
+            if isinstance(self.scale_, np.ndarray):
+                self.scale_ = self.scale_.astype(y_scale.dtype)
 
         elif self.method == "robust":
-            if isinstance(y, torch.Tensor):
-                self.center_ = torch.median(y, dim=-1).values
-                q_75 = y.kthvalue(int(len(y) * 0.75), dim=-1).values
-                q_25 = y.kthvalue(int(len(y) * 0.25), dim=-1).values
-            elif isinstance(y, np.ndarray):
-                self.center_ = np.median(y, axis=-1)
-                q_75 = np.percentile(y, 75, axis=-1)
-                q_25 = np.percentile(y, 25, axis=-1)
+            if isinstance(y_center, torch.Tensor):
+                self.center_ = y_center.quantile(self.method_kwargs.get("center", 0.5), dim=-1)
+                q_75 = y_scale.quantile(self.method_kwargs.get("upper", 0.75), dim=-1)
+                q_25 = y_scale.quantile(self.method_kwargs.get("lower", 0.25), dim=-1)
+            elif isinstance(y_center, np.ndarray):
+                self.center_ = np.percentile(y_center, self.method_kwargs.get("center", 0.5) * 100, axis=-1)
+                q_75 = np.percentile(y_scale, self.method_kwargs.get("upper", 0.75) * 100, axis=-1)
+                q_25 = np.percentile(y_scale, self.method_kwargs.get("lower", 0.25) * 100, axis=-1)
             else:
-                self.center_ = np.median(y)
-                q_75 = np.percentile(y, 75)
-                q_25 = np.percentile(y, 25)
-            self.scale_ = (q_75 - q_25) / 2.0 + self.eps
-        if not self.center:
+                self.center_ = np.percentile(y_center, self.method_kwargs.get("center", 0.5) * 100, axis=-1)
+                q_75 = np.percentile(y_scale, self.method_kwargs.get("upper", 0.75) * 100)
+                q_25 = np.percentile(y_scale, self.method_kwargs.get("lower", 0.25) * 100)
+            self.scale_ = (q_75 - q_25) / 2.0 + eps
+        if not self.center and self.method != "identity":
             self.scale_ = self.center_
-            if isinstance(y, torch.Tensor):
+            if isinstance(y_center, torch.Tensor):
                 self.center_ = torch.zeros_like(self.center_)
             else:
                 self.center_ = np.zeros_like(self.center_)
@@ -375,8 +521,6 @@ class TorchNormalizer(BaseEstimator, TransformerMixin):
                 "the data or using data with higher variance for numerical stability",
                 UserWarning,
             )
-
-        return self
 
     def transform(
         self,
@@ -407,7 +551,12 @@ class TorchNormalizer(BaseEstimator, TransformerMixin):
             scale = scale.view(*scale.size(), *(1,) * (y.ndim - scale.ndim))
 
         # transform
+        dtype = y.dtype
         y = (y - center) / scale
+        try:
+            y = y.astype(dtype)
+        except AttributeError:  # torch.Tensor has `.type()` instead of `.astype()`
+            y = y.type(dtype)
 
         # return with center and scale or without
         if return_norm:
@@ -439,6 +588,9 @@ class TorchNormalizer(BaseEstimator, TransformerMixin):
         Returns:
             torch.Tensor: de-scaled data
         """
+        # ensure output dtype matches input dtype
+        dtype = data["prediction"].dtype
+
         # inverse transformation with tensors
         norm = data["target_scale"]
 
@@ -454,7 +606,7 @@ class TorchNormalizer(BaseEstimator, TransformerMixin):
         # return correct shape
         if data["prediction"].ndim == 1 and y.ndim > 1:
             y = y.squeeze(0)
-        return y
+        return y.type(dtype)
 
 
 class EncoderNormalizer(TorchNormalizer):
@@ -465,7 +617,102 @@ class EncoderNormalizer(TorchNormalizer):
     This normalizer can be particularly useful as target normalizer.
     """
 
-    pass
+    def __init__(
+        self,
+        method: str = "standard",
+        center: bool = True,
+        max_length: Union[int, List[int]] = None,
+        transformation: Union[str, Tuple[Callable, Callable]] = None,
+        method_kwargs: Dict[str, Any] = {},
+    ):
+        """
+        Initialize
+
+        Args:
+            method (str, optional): method to rescale series. Either "identity", "standard" (standard scaling)
+                or "robust" (scale using quantiles 0.25-0.75). Defaults to "standard".
+            method_kwargs (Dict[str, Any], optional): Dictionary of method specific arguments as listed below
+                * "robust" method: "upper", "lower", "center" quantiles defaulting to 0.75, 0.25 and 0.5
+            center (bool, optional): If to center the output to zero. Defaults to True.
+            max_length(Union[int, List[int]], optional): Maximum length to take into account for calculating
+                parameters. If tuple, first length is maximum length for calculating center and second is maximum
+                length for calculating scale. Defaults to entire length of time series.
+            transformation (Union[str, Tuple[Callable, Callable]] optional): Transform values before
+                applying normalizer. Available options are
+
+                * None (default): No transformation of values
+                * log: Estimate in log-space leading to a multiplicative model
+                * log1p: Estimate in log-space but add 1 to values before transforming for stability
+                    (e.g. if many small values <<1 are present).
+                    Note, that inverse transform is still only `torch.exp()` and not `torch.expm1()`.
+                * logit: Apply logit transformation on values that are between 0 and 1
+                * count: Apply softplus to output (inverse transformation) and x + 1 to input (transformation)
+                * softplus: Apply softplus to output (inverse transformation) and inverse softplus to input
+                    (transformation)
+                * relu: Apply max(0, x) to output
+                * Dict[str, Callable] of PyTorch functions that transforms and inversely transforms values.
+                  ``forward`` and ``reverse`` entries are required. ``inverse`` transformation is optional and
+                  should be defined if ``reverse`` is not the inverse of the forward transformation. ``inverse_torch``
+                  can be defined to provide a torch distribution transform for inverse transformations.
+        """
+        super().__init__(method=method, center=center, transformation=transformation, method_kwargs=method_kwargs)
+        self.max_length = max_length
+
+    def fit(self, y: Union[pd.Series, np.ndarray, torch.Tensor]):
+        """
+        Fit transformer, i.e. determine center and scale of data
+
+        Args:
+            y (Union[pd.Series, np.ndarray, torch.Tensor]): input data
+
+        Returns:
+            TorchNormalizer: self
+        """
+        # reduce size of time series - take only max length
+        if self.max_length is None:
+            y_center = y_scale = self.preprocess(y)
+        elif isinstance(self.max_length, int):
+            y_center = y_scale = self.preprocess(self._slice(y, slice(-self.max_length, None)))
+        else:
+            y = self.preprocess(self._slice(y, slice(-max(self.max_length), None)))
+            if np.argmax(self.max_length) == 0:
+                y_center = y
+                y_scale = self._slice(y, slice(-self.max_length[1], None))
+            else:
+                y_center = self._slice(y, slice(-self.max_length[0], None))
+                y_scale = y
+        # set parameters for normalization
+        self._set_parameters(y_center=y_center, y_scale=y_scale)
+        return self
+
+    @property
+    def min_length(self):
+        if self.method == "identity":
+            return 0  # no timeseries properties used
+        elif self.center:
+            return 1  # only calculation of mean required
+        else:
+            return 2  # requires std, i.e. at least 2 entries
+
+    @staticmethod
+    def _slice(
+        x: Union[pd.DataFrame, pd.Series, np.ndarray, torch.Tensor], s: slice
+    ) -> Union[pd.DataFrame, pd.Series, np.ndarray, torch.Tensor]:
+        """
+        Slice pandas data frames, numpy arrays and tensors.
+
+        Args:
+            x (Union[pd.Series, np.ndarray, torch.Tensor]): object to slice
+            s (slice): slice, e.g. ``slice(None, -5)```
+
+        Returns:
+            Union[pd.Series, np.ndarray, torch.Tensor]: sliced object
+        """
+
+        if isinstance(x, (pd.DataFrame, pd.Series)):
+            return x[s]
+        else:
+            return x[..., s]
 
 
 class GroupNormalizer(TorchNormalizer):
@@ -483,7 +730,7 @@ class GroupNormalizer(TorchNormalizer):
         center: bool = True,
         scale_by_group: bool = False,
         transformation: Union[str, Tuple[Callable, Callable]] = None,
-        eps: float = 1e-8,
+        method_kwargs: Dict[str, Any] = {},
     ):
         """
         Group normalizer to normalize a given entry by groups. Can be used as target normalizer.
@@ -491,6 +738,8 @@ class GroupNormalizer(TorchNormalizer):
         Args:
             method (str, optional): method to rescale series. Either "standard" (standard scaling) or "robust"
                 (scale using quantiles 0.25-0.75). Defaults to "standard".
+            method_kwargs (Dict[str, Any], optional): Dictionary of method specific arguments as listed below
+                * "robust" method: "upper", "lower", "center" quantiles defaulting to 0.75, 0.25 and 0.5
             groups (List[str], optional): Group names to normalize by. Defaults to [].
             center (bool, optional): If to center the output to zero. Defaults to True.
             scale_by_group (bool, optional): If to scale the output by group, i.e. norm is calculated as
@@ -500,25 +749,24 @@ class GroupNormalizer(TorchNormalizer):
 
                 * None (default): No transformation of values
                 * log: Estimate in log-space leading to a multiplicative model
-                * logp1: Estimate in log-space but add 1 to values before transforming for stability
+                * log1p: Estimate in log-space but add 1 to values before transforming for stability
                     (e.g. if many small values <<1 are present).
                     Note, that inverse transform is still only `torch.exp()` and not `torch.expm1()`.
                 * logit: Apply logit transformation on values that are between 0 and 1
-                * softplus: Apply softplus to output (inverse transformation) and x + 1 to input (transformation)
+                * count: Apply softplus to output (inverse transformation) and x + 1 to input
+                    (transformation)
+                * softplus: Apply softplus to output (inverse transformation) and inverse softplus to input
+                    (transformation)
                 * relu: Apply max(0, x) to output
-                * Tuple[Callable, Callable] of PyTorch functions that transforms and inversely transforms values.
+                * Dict[str, Callable] of PyTorch functions that transforms and inversely transforms values.
+                  ``forward`` and ``reverse`` entries are required. ``inverse`` transformation is optional and
+                  should be defined if ``reverse`` is not the inverse of the forward transformation. ``inverse_torch``
+                  can be defined to provide a torch distribution transform for inverse transformations.
 
-            eps (float, optional): Number for numerical stability of calcualtions.
-                Defaults to 1e-8. For count data, 1.0 is recommended.
         """
         self.groups = groups
         self.scale_by_group = scale_by_group
-        super().__init__(
-            method=method,
-            center=center,
-            transformation=transformation,
-            eps=eps,
-        )
+        super().__init__(method=method, center=center, transformation=transformation, method_kwargs=method_kwargs)
 
     def fit(self, y: pd.Series, X: pd.DataFrame):
         """
@@ -532,18 +780,26 @@ class GroupNormalizer(TorchNormalizer):
             self
         """
         y = self.preprocess(y)
+        eps = np.finfo(np.float16).eps
         if len(self.groups) == 0:
             assert not self.scale_by_group, "No groups are defined, i.e. `scale_by_group=[]`"
             if self.method == "standard":
-                self.norm_ = {"center": np.mean(y), "scale": np.std(y) + self.eps}  # center and scale
+                self.norm_ = {"center": np.mean(y), "scale": np.std(y) + eps}  # center and scale
             else:
-                quantiles = np.quantile(y, [0.25, 0.5, 0.75])
+                quantiles = np.quantile(
+                    y,
+                    [
+                        self.method_kwargs.get("lower", 0.25),
+                        self.method_kwargs.get("center", 0.5),
+                        self.method_kwargs.get("upper", 0.75),
+                    ],
+                )
                 self.norm_ = {
                     "center": quantiles[1],
-                    "scale": (quantiles[2] - quantiles[0]) / 2.0 + self.eps,
+                    "scale": (quantiles[2] - quantiles[0]) / 2.0 + eps,
                 }  # center and scale
             if not self.center:
-                self.norm_["scale"] = self.norm_["center"] + self.eps
+                self.norm_["scale"] = self.norm_["center"] + eps
                 self.norm_["center"] = 0.0
 
         elif self.scale_by_group:
@@ -553,7 +809,7 @@ class GroupNormalizer(TorchNormalizer):
                     .assign(y=y)
                     .groupby(g, observed=True)
                     .agg(center=("y", "mean"), scale=("y", "std"))
-                    .assign(center=lambda x: x["center"], scale=lambda x: x.scale + self.eps)
+                    .assign(center=lambda x: x["center"], scale=lambda x: x.scale + eps)
                     for g in self.groups
                 }
             else:
@@ -561,11 +817,21 @@ class GroupNormalizer(TorchNormalizer):
                     g: X[[g]]
                     .assign(y=y)
                     .groupby(g, observed=True)
-                    .y.quantile([0.25, 0.5, 0.75])
+                    .y.quantile(
+                        [
+                            self.method_kwargs.get("lower", 0.25),
+                            self.method_kwargs.get("center", 0.5),
+                            self.method_kwargs.get("upper", 0.75),
+                        ]
+                    )
                     .unstack(-1)
                     .assign(
-                        center=lambda x: x[0.5],
-                        scale=lambda x: (x[0.75] - x[0.25]) / 2.0 + self.eps,
+                        center=lambda x: x[self.method_kwargs.get("center", 0.5)],
+                        scale=lambda x: (
+                            x[self.method_kwargs.get("upper", 0.75)] - x[self.method_kwargs.get("lower", 0.25)]
+                        )
+                        / 2.0
+                        + eps,
                     )[["center", "scale"]]
                     for g in self.groups
                 }
@@ -573,7 +839,7 @@ class GroupNormalizer(TorchNormalizer):
             if not self.center:  # swap center and scale
 
                 def swap_parameters(norm):
-                    norm["scale"] = norm["center"] + self.eps
+                    norm["scale"] = norm["center"] + eps
                     norm["center"] = 0.0
                     return norm
 
@@ -587,22 +853,32 @@ class GroupNormalizer(TorchNormalizer):
                     .assign(y=y)
                     .groupby(self.groups, observed=True)
                     .agg(center=("y", "mean"), scale=("y", "std"))
-                    .assign(center=lambda x: x["center"], scale=lambda x: x.scale + self.eps)
+                    .assign(center=lambda x: x["center"], scale=lambda x: x.scale + eps)
                 )
             else:
                 self.norm_ = (
                     X[self.groups]
                     .assign(y=y)
                     .groupby(self.groups, observed=True)
-                    .y.quantile([0.25, 0.5, 0.75])
+                    .y.quantile(
+                        [
+                            self.method_kwargs.get("lower", 0.25),
+                            self.method_kwargs.get("center", 0.5),
+                            self.method_kwargs.get("upper", 0.75),
+                        ]
+                    )
                     .unstack(-1)
                     .assign(
-                        center=lambda x: x[0.5],
-                        scale=lambda x: (x[0.75] - x[0.25]) / 2.0 + self.eps,
+                        center=lambda x: x[self.method_kwargs.get("center", 0.5)],
+                        scale=lambda x: (
+                            x[self.method_kwargs.get("upper", 0.75)] - x[self.method_kwargs.get("lower", 0.25)]
+                        )
+                        / 2.0
+                        + eps,
                     )[["center", "scale"]]
                 )
             if not self.center:  # swap center and scale
-                self.norm_["scale"] = self.norm_["center"] + self.eps
+                self.norm_["scale"] = self.norm_["center"] + eps
                 self.norm_["center"] = 0.0
             self.missing_ = self.norm_.median().to_dict()
 
@@ -672,10 +948,13 @@ class GroupNormalizer(TorchNormalizer):
             Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]: Scaled data, if ``return_norm=True``, returns also scales
                 as second element
         """
+        # # check if arguments are wrong way round
+        if isinstance(y, pd.DataFrame) and not isinstance(X, pd.DataFrame):
+            raise ValueError("X and y is in wrong positions")
         if target_scale is None:
             assert X is not None, "either target_scale or X has to be passed"
             target_scale = self.get_norm(X)
-        return super().transform(y=y, return_norm=return_norm, target_scale=target_scale)
+        return super().transform(y, return_norm=return_norm, target_scale=target_scale)
 
     def get_parameters(self, groups: Union[torch.Tensor, list, tuple], group_names: List[str] = None) -> np.ndarray:
         """
@@ -779,7 +1058,7 @@ class MultiNormalizer(TorchNormalizer):
 
         for idx, normalizer in enumerate(self.normalizers):
             if isinstance(normalizer, GroupNormalizer):
-                normalizer.fit(y[:, idx], X=X)
+                normalizer.fit(y[:, idx], X)
             else:
                 normalizer.fit(y[:, idx])
 
@@ -838,7 +1117,7 @@ class MultiNormalizer(TorchNormalizer):
             else:
                 scale = None
             if isinstance(normalizer, GroupNormalizer):
-                r = normalizer.transform(y[idx], X=X, return_norm=return_norm, target_scale=scale)
+                r = normalizer.transform(y[idx], X, return_norm=return_norm, target_scale=scale)
             else:
                 r = normalizer.transform(y[idx], return_norm=return_norm, target_scale=scale)
             res.append(r)
@@ -906,17 +1185,23 @@ class MultiNormalizer(TorchNormalizer):
                         results = []
                         for idx, norm in enumerate(self.normalizers):
                             new_args = [
-                                arg[idx]
-                                if isinstance(arg, (list, tuple))
-                                and not isinstance(arg, rnn.PackedSequence)
-                                and len(arg) == n
-                                else arg
+                                (
+                                    arg[idx]
+                                    if isinstance(arg, (list, tuple))
+                                    and not isinstance(arg, rnn.PackedSequence)
+                                    and len(arg) == n
+                                    else arg
+                                )
                                 for arg in args
                             ]
                             new_kwargs = {
-                                key: val[idx]
-                                if isinstance(val, list) and not isinstance(val, rnn.PackedSequence) and len(val) == n
-                                else val
+                                key: (
+                                    val[idx]
+                                    if isinstance(val, list)
+                                    and not isinstance(val, rnn.PackedSequence)
+                                    and len(val) == n
+                                    else val
+                                )
                                 for key, val in kwargs.items()
                             }
                             results.append(getattr(norm, name)(*new_args, **new_kwargs))
